@@ -6,9 +6,11 @@ import (
 	cs "github.com/wind-c/comqtt/v2/cluster"
 	"github.com/wind-c/comqtt/v2/cluster/discovery"
 	rt "github.com/wind-c/comqtt/v2/mqtt/rest"
+	"io"
 	"net/http"
 	"net/netip"
 	"strings"
+	"time"
 )
 
 type rest struct {
@@ -37,6 +39,9 @@ func (s *rest) GenHandlers() map[string]rt.Handler {
 		"GET /api/v1/cluster/stat/overall":      s.getOverall,
 		"POST /api/v1/cluster/blacklist/{id}":   s.kickClient,
 		"DELETE /api/v1/cluster/blacklist/{id}": s.blanchClient,
+		"GET /api/v1/cluster/bans":             s.getBans,
+		"POST /api/v1/cluster/bans/{id}":       s.addBan,
+		"DELETE /api/v1/cluster/bans/{id}":     s.delBan,
 	}
 }
 
@@ -169,6 +174,69 @@ func (s *rest) blanchClient(w http.ResponseWriter, r *http.Request) {
 	urls := genUrls(s.agent.GetMemberList(), path)
 	rs := fetchM(HttpDelete, urls, nil)
 	rt.Ok(w, rs)
+}
+
+// banRequest is the optional body of POST /cluster/bans/{id}.
+type banRequest struct {
+	TTLSeconds int64  `json:"ttl_seconds"`
+	Reason     string `json:"reason"`
+}
+
+// getBans returns the cluster-wide ban policies (temporary and permanent)
+// replicated through raft, including remaining time of temporary bans.
+// GET api/v1/cluster/bans
+func (s *rest) getBans(w http.ResponseWriter, r *http.Request) {
+	rt.Ok(w, s.agent.BanList())
+}
+
+// addBan replicates a ban for the client id across the cluster. ttl_seconds
+// == 0 (or an empty body) means permanent; positive ttl_seconds creates a
+// temporary ban that is rejected by every node until it expires. The ban is
+// durable through raft, so it survives node restarts and nodes that were
+// briefly offline converge to the same generation when they catch up.
+// POST api/v1/cluster/bans/{id}
+func (s *rest) addBan(w http.ResponseWriter, r *http.Request) {
+	cid := r.PathValue("id")
+	if cid == "" {
+		rt.Error(w, http.StatusBadRequest, "client id is required")
+		return
+	}
+
+	var req banRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			rt.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.TTLSeconds < 0 {
+		rt.Error(w, http.StatusBadRequest, "ttl_seconds must be greater than or equal to 0")
+		return
+	}
+
+	policy, err := s.agent.BanClient(cid, req.Reason, time.Duration(req.TTLSeconds)*time.Second)
+	if err != nil {
+		// a timeout does not prove the proposal failed; the caller may
+		// retry - re-proposing a ban never weakens the policy
+		rt.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	rt.Ok(w, policy)
+}
+
+// delBan removes the ban policy for the client id across the cluster.
+// DELETE api/v1/cluster/bans/{id}
+func (s *rest) delBan(w http.ResponseWriter, r *http.Request) {
+	cid := r.PathValue("id")
+	if cid == "" {
+		rt.Error(w, http.StatusBadRequest, "client id is required")
+		return
+	}
+	if err := s.agent.UnbanClient(cid); err != nil {
+		rt.Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	rt.Ok(w, map[string]string{"id": cid})
 }
 
 func (s *rest) getClients(w http.ResponseWriter, r *http.Request) {

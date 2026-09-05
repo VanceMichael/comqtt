@@ -1,0 +1,1895 @@
+diff --git a/cluster/agent.go b/cluster/agent.go
+index 7b4b1db..fdebfa7 100644
+--- a/cluster/agent.go
++++ b/cluster/agent.go
+@@ -7,12 +7,14 @@ package cluster
+ import (
+ 	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"math/rand"
+ 	"net"
+ 	"path"
+ 	"path/filepath"
+ 	"strconv"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/panjf2000/ants/v2"
+ 	"github.com/wind-c/comqtt/v2/cluster/discovery"
+@@ -82,6 +84,8 @@ func (a *Agent) Start() (err error) {
+ 
+ 	// listen for raft apply notifications
+ 	go a.raftApplyListener()
++	// leader purges expired temporary ban generations through raft
++	go a.banSweeper()
+ 
+ 	if a.Config.RaftImpl == config.RaftImplEtcd {
+ 		if a.raftPeer, err = etcd.Setup(a.Config, a.raftNotifyCh); err != nil {
+@@ -241,6 +245,17 @@ func (a *Agent) raftApplyListener() {
+ 	for {
+ 		select {
+ 		case msg := <-a.raftNotifyCh:
++			// ban notifications are consumed on every node, including the
++			// proposer: the local mirror must be updated and the banned
++			// client's live connection on this node must be torn down.
++			switch msg.Type {
++			case message.BanAdd:
++				a.applyBanAdd(msg)
++				continue
++			case message.BanDel:
++				a.applyBanDel(msg)
++				continue
++			}
+ 			if msg.NodeID == "" || msg.NodeID == a.GetLocalName() || len(msg.Payload) == 0 {
+ 				continue
+ 			}
+@@ -258,6 +273,37 @@ func (a *Agent) raftApplyListener() {
+ 	}
+ }
+ 
++// applyBanAdd mirrors a raft-committed ban into the local server book and
++// immediately disconnects the client if it is connected to this node.
++func (a *Agent) applyBanAdd(msg *message.Message) {
++	var ban raft.Ban
++	if err := json.Unmarshal(msg.Payload, &ban); err != nil {
++		log.Error("apply ban unmarshal", "error", err)
++		return
++	}
++	a.mqttServer.ApplyBan(ban.ClientID, ban.Reason, ban.CreatedAt, ban.ExpiresAt)
++	if cl, ok := a.mqttServer.Clients.Get(ban.ClientID); ok {
++		if err := a.mqttServer.DisconnectClient(cl, packets.ErrNotAuthorized); err != nil {
++			log.Debug("disconnect banned client", "cid", ban.ClientID, "error", err)
++		}
++		log.Info("ban disconnect client", "cid", ban.ClientID)
++	}
++}
++
++// applyBanDel mirrors a raft-committed ban removal into the local server book.
++func (a *Agent) applyBanDel(msg *message.Message) {
++	var rm raft.BanRemoval
++	if err := json.Unmarshal(msg.Payload, &rm); err != nil {
++		log.Error("apply unban unmarshal", "error", err)
++		return
++	}
++	if rm.CreatedAt > 0 && rm.ExpiresAt > 0 {
++		a.mqttServer.RemoveBanGeneration(rm.ClientID, rm.CreatedAt, rm.ExpiresAt)
++	} else {
++		a.mqttServer.ApplyBanRemoval(rm.ClientID, rm.At)
++	}
++}
++
+ // send the message to the leader apply
+ func (a *Agent) raftPropose(msg *message.Message) {
+ 	if a.raftPeer.IsApplyRight() {
+@@ -341,7 +387,7 @@ func (a *Agent) processRelayMsg(msg *message.Message) {
+ 		addr := string(msg.Payload)
+ 		err := a.raftPeer.Join(msg.NodeID, addr)
+ 		OnJoinLog(msg.NodeID, addr, "raft join", err)
+-	case packets.Subscribe, packets.Unsubscribe:
++	case packets.Subscribe, packets.Unsubscribe, message.BanAdd, message.BanDel:
+ 		a.raftPropose(msg)
+ 	case packets.Publish:
+ 		pk := packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Publish}}
+@@ -579,3 +625,139 @@ func (a *Agent) GetValue(key string) []string {
+ 	log.Info("get value", "key", key)
+ 	return a.raftPeer.Lookup(key)
+ }
++
++// banSweepInterval is how often the leader purges expired temporary bans
++// from the replicated ban book. Enforcement never depends on the sweep:
++// reads treat expired generations as inactive (lazy expiry).
++const banSweepInterval = 30 * time.Second
++
++// BanClient proposes a cluster-wide ban for clientID. A ttl <= 0 means a
++// permanent ban. The ban generation becomes durable through raft: it
++// survives node restarts, is replicated to nodes that were briefly offline
++// when they catch up, and every node disconnects the client's live
++// connection on apply. Proposing is idempotent: retries after timeouts
++// never produce a weaker result than the newest committed generation.
++func (a *Agent) BanClient(clientID, reason string, ttl time.Duration) (mqtt.BanPolicy, error) {
++	now := time.Now()
++	createdAt := now.UnixNano()
++	expiresAt := int64(raft.BanExpiresNever)
++	if ttl > 0 {
++		expiresAt = now.Add(ttl).UnixNano()
++	}
++
++	ban := raft.Ban{ClientID: clientID, Reason: reason, CreatedAt: createdAt, ExpiresAt: expiresAt}
++	payload, err := json.Marshal(ban)
++	if err != nil {
++		return mqtt.BanPolicy{}, err
++	}
++	msg := &message.Message{
++		Type:     message.BanAdd,
++		NodeID:   a.GetLocalName(),
++		ClientID: clientID,
++		Payload:  payload,
++	}
++
++	if a.raftPeer.IsApplyRight() {
++		err = a.raftPeer.Propose(msg)
++		OnApplyLog(a.GetLocalName(), msg.NodeID, msg.Type, []byte(msg.ClientID), "raft ban apply", err)
++	} else {
++		// follower: hand over to the leader (or broadcast when no leader is
++		// known); delivery is best-effort exactly like subscription proposes.
++		a.raftPropose(msg)
++	}
++	if err != nil {
++		return mqtt.BanPolicy{}, err
++	}
++
++	policy := mqtt.BanPolicy{
++		ClientID:  clientID,
++		Reason:    reason,
++		Permanent: expiresAt == raft.BanExpiresNever,
++		CreatedAt: createdAt / int64(time.Second),
++		ExpiresAt: expiresAt / int64(time.Second),
++		Remaining: banTTLSeconds(expiresAt, now.UnixNano()),
++	}
++	return policy, nil
++}
++
++// UnbanClient proposes removal of the ban generation for clientID. The
++// removal is fenced by the request time so that a delayed/stale unban never
++// deletes a newer ban generation.
++func (a *Agent) UnbanClient(clientID string) error {
++	rm := raft.BanRemoval{ClientID: clientID, At: time.Now().UnixNano()}
++	payload, err := json.Marshal(rm)
++	if err != nil {
++		return err
++	}
++	msg := &message.Message{
++		Type:     message.BanDel,
++		NodeID:   a.GetLocalName(),
++		ClientID: clientID,
++		Payload:  payload,
++	}
++	if a.raftPeer.IsApplyRight() {
++		err = a.raftPeer.Propose(msg)
++		OnApplyLog(a.GetLocalName(), msg.NodeID, msg.Type, []byte(msg.ClientID), "raft unban apply", err)
++	} else {
++		a.raftPropose(msg)
++	}
++	return err
++}
++
++// BanList returns the cluster-wide ban policies as mirrored on this node.
++// The mirror is the raft state applied so far, so after catch-up it is
++// identical on every node.
++func (a *Agent) BanList() []mqtt.BanPolicy {
++	return a.mqttServer.BanList()
++}
++
++// banSweeper periodically proposes removal of expired temporary ban
++// generations. Only the leader proposes, which keeps duplicate log entries
++// out; a leadership change simply moves the job. Cleanup entries identify
++// the exact generation they observed, so a re-ban racing the cleanup is
++// never deleted.
++func (a *Agent) banSweeper() {
++	ticker := time.NewTicker(banSweepInterval)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ticker.C:
++			if a.raftPeer == nil || !a.raftPeer.IsApplyRight() {
++				continue
++			}
++			now := time.Now().UnixNano()
++			for _, ban := range a.raftPeer.ListBans() {
++				if ban.ExpiresAt == raft.BanExpiresNever || now < ban.ExpiresAt {
++					continue
++				}
++				payload, err := json.Marshal(raft.BanRemoval{
++					ClientID:  ban.ClientID,
++					CreatedAt: ban.CreatedAt,
++					ExpiresAt: ban.ExpiresAt,
++				})
++				if err != nil {
++					continue
++				}
++				a.raftPropose(&message.Message{
++					Type:     message.BanDel,
++					NodeID:   a.GetLocalName(),
++					ClientID: ban.ClientID,
++					Payload:  payload,
++				})
++				log.Info("raft ban expiry cleanup proposed", "cid", ban.ClientID)
++			}
++		case <-a.ctx.Done():
++			return
++		}
++	}
++}
++
++func banTTLSeconds(expiresAt, now int64) int64 {
++	if expiresAt == raft.BanExpiresNever {
++		return -1
++	}
++	if expiresAt <= now {
++		return 0
++	}
++	return (expiresAt - now) / int64(time.Second)
++}
+diff --git a/cluster/message/message.go b/cluster/message/message.go
+index 0290722..2dce2cd 100644
+--- a/cluster/message/message.go
++++ b/cluster/message/message.go
+@@ -15,6 +15,10 @@ const (
+ 	Reserved byte = iota + 21
+ 	RaftJoin
+ 	RaftApply
++	// BanAdd replicates a client ban policy (temporary or permanent)
++	BanAdd
++	// BanDel replicates a client ban removal (explicit unban or expiry cleanup)
++	BanDel
+ )
+ 
+ //go:generate msgp -io=false
+diff --git a/cluster/raft/ban_test.go b/cluster/raft/ban_test.go
+new file mode 100644
+index 0000000..0bd5a99
+--- /dev/null
++++ b/cluster/raft/ban_test.go
+@@ -0,0 +1,130 @@
++// SPDX-License-Identifier: MIT
++// SPDX-FileContributor: wind (573966@qq.com)
++
++package raft
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestBanBook_PutNewerWins(t *testing.T) {
++	bk := NewBanBook()
++	base := time.Now().UnixNano()
++
++	require.True(t, bk.Put(Ban{ClientID: "c1", CreatedAt: base, ExpiresAt: base + 1000}))
++
++	// older generation (delayed/reordered proposal) must not overwrite
++	require.False(t, bk.Put(Ban{ClientID: "c1", CreatedAt: base - 10, ExpiresAt: base + 500}))
++	got, ok := bk.Get("c1")
++	require.True(t, ok)
++	require.Equal(t, base+1000, got.ExpiresAt)
++
++	// same CreatedAt is an idempotent retry
++	require.True(t, bk.Put(Ban{ClientID: "c1", CreatedAt: base, ExpiresAt: base + 1000, Reason: "again"}))
++	got, _ = bk.Get("c1")
++	require.Equal(t, "again", got.Reason)
++
++	// newer generation (re-ban) overwrites
++	require.True(t, bk.Put(Ban{ClientID: "c1", CreatedAt: base + 20, ExpiresAt: BanExpiresNever}))
++	got, _ = bk.Get("c1")
++	require.True(t, got.Permanent())
++}
++
++func TestBanBook_RemoveFencedByTime(t *testing.T) {
++	bk := NewBanBook()
++	ct := int64(1000)
++	bk.Put(Ban{ClientID: "c1", CreatedAt: ct, ExpiresAt: 5000})
++
++	// unban requested before the ban existed (stale/delayed unban) must not remove
++	require.False(t, bk.Remove("c1", ct-1))
++	_, ok := bk.Get("c1")
++	require.True(t, ok)
++
++	// unban requested after the ban removes it
++	require.True(t, bk.Remove("c1", ct+100))
++	_, ok = bk.Get("c1")
++	require.False(t, ok)
++	require.False(t, bk.Remove("c1", ct+200))
++}
++
++func TestBanBook_RemoveDoesNotTouchNewerReban(t *testing.T) {
++	bk := NewBanBook()
++	// ban at t=1000, unban requested at t=2000, then re-ban at t=3000
++	bk.Put(Ban{ClientID: "c1", CreatedAt: 3000, ExpiresAt: 9000})
++	// a delayed unban from t=2000 arrives after the re-ban
++	require.False(t, bk.Remove("c1", 2000))
++	got, ok := bk.Get("c1")
++	require.True(t, ok)
++	require.Equal(t, int64(3000), got.CreatedAt)
++}
++
++func TestBanBook_RemoveGeneration(t *testing.T) {
++	bk := NewBanBook()
++	bk.Put(Ban{ClientID: "c1", CreatedAt: 1000, ExpiresAt: 2000})
++
++	// cleanup for a different generation (newer re-ban) must not delete
++	bk.Put(Ban{ClientID: "c1", CreatedAt: 3000, ExpiresAt: 4000})
++	require.False(t, bk.RemoveGeneration("c1", 1000, 2000))
++	got, ok := bk.Get("c1")
++	require.True(t, ok)
++	require.Equal(t, int64(3000), got.CreatedAt)
++
++	// exact generation match deletes
++	require.True(t, bk.RemoveGeneration("c1", 3000, 4000))
++	_, ok = bk.Get("c1")
++	require.False(t, ok)
++}
++
++func TestBanBook_ExpirySweepScenario(t *testing.T) {
++	bk := NewBanBook()
++	now := time.Now().UnixNano()
++
++	// expired temporary ban
++	bk.Put(Ban{ClientID: "expired", CreatedAt: now - 2000, ExpiresAt: now - 1000})
++	// active temporary ban
++	bk.Put(Ban{ClientID: "active", CreatedAt: now, ExpiresAt: now + 1000})
++	// permanent ban
++	bk.Put(Ban{ClientID: "forever", CreatedAt: now, ExpiresAt: BanExpiresNever})
++
++	all := bk.All()
++	require.Len(t, all, 3)
++
++	// the leader's sweeper would remove only the expired generation
++	require.True(t, bk.RemoveGeneration("expired", now-2000, now-1000))
++	_, ok := bk.Get("expired")
++	require.False(t, ok)
++
++	// permanent and active generations survive
++	_, ok = bk.Get("forever")
++	require.True(t, ok)
++	got, ok := bk.Get("active")
++	require.True(t, ok)
++	require.False(t, got.Expired(now))
++	require.False(t, got.Permanent())
++
++	forever, _ := bk.Get("forever")
++	require.True(t, forever.Permanent())
++	require.False(t, forever.Expired(now))
++}
++
++func TestBanBook_SnapshotRestore(t *testing.T) {
++	src := NewBanBook()
++	src.Put(Ban{ClientID: "c1", Reason: "r1", CreatedAt: 1, ExpiresAt: 2})
++	src.Put(Ban{ClientID: "c2", CreatedAt: 3, ExpiresAt: BanExpiresNever})
++
++	dst := NewBanBook()
++	dst.Put(Ban{ClientID: "stale", CreatedAt: 9, ExpiresAt: 10})
++	dst.Restore(src.Snapshot())
++
++	_, ok := dst.Get("stale")
++	require.False(t, ok)
++	b, ok := dst.Get("c1")
++	require.True(t, ok)
++	require.Equal(t, "r1", b.Reason)
++	b2, ok := dst.Get("c2")
++	require.True(t, ok)
++	require.True(t, b2.Permanent())
++}
+diff --git a/cluster/raft/base.go b/cluster/raft/base.go
+index 9667e19..caf9fff 100644
+--- a/cluster/raft/base.go
++++ b/cluster/raft/base.go
+@@ -18,6 +18,7 @@ type IPeer interface {
+ 	Leave(nodeID string) error
+ 	Propose(msg *message.Message) error
+ 	Lookup(key string) []string
++	ListBans() []Ban
+ 	IsApplyRight() bool
+ 	GetLeader() (addr, id string)
+ 	GenPeersFile(file string) error
+@@ -64,6 +65,34 @@ func (k *KV) Restore(r io.Reader) error {
+ 	return nil
+ }
+ 
++// RestoreSnapshot decodes a snapshot stream that holds the subscription map
++// first and the ban-policy map second (the bans object may be absent in
++// snapshots written by older versions). A single gob.Decoder is used for
++// both objects: gob buffers its reads, so a second decoder on the same
++// reader would only see EOF for wrapped readers that hide the underlying
++// Reader's ReadByte method.
++func (k *KV) RestoreSnapshot(r io.Reader, bk *BanBook) error {
++	dec := gob.NewDecoder(r)
++
++	var d data
++	if err := dec.Decode(&d); err != nil {
++		return err
++	}
++	k.Lock()
++	if d == nil {
++		d = make(data)
++	}
++	k.data = d
++	k.Unlock()
++
++	var bans map[string]Ban
++	if err := dec.Decode(&bans); err != nil && err != io.EOF {
++		return err
++	}
++	bk.Restore(bans)
++	return nil
++}
++
+ func (k *KV) Get(key string) []string {
+ 	k.RLock()
+ 	defer k.RUnlock()
+@@ -132,3 +161,137 @@ func (k *KV) DelByValue(value string) int {
+ 	}
+ 	return c
+ }
++
++// BanExpiresNever is the ExpiresAt value of a permanent ban.
++const BanExpiresNever int64 = 0
++
++// Ban is a client ban policy replicated through raft. Timestamps are unix
++// nanoseconds so that concurrent actions on different nodes keep a total
++// ordering even within the same wall-clock second.
++type Ban struct {
++	ClientID  string `json:"cid"`
++	Reason    string `json:"r,omitempty"`
++	CreatedAt int64  `json:"ct"` // request time of the ban, acts as fencing token
++	ExpiresAt int64  `json:"et"` // unix nano; BanExpiresNever (0) means permanent
++}
++
++// Permanent reports whether the ban never expires.
++func (b Ban) Permanent() bool {
++	return b.ExpiresAt == BanExpiresNever
++}
++
++// Expired reports whether the ban has expired at the given unix nano time.
++func (b Ban) Expired(now int64) bool {
++	return b.ExpiresAt != BanExpiresNever && now >= b.ExpiresAt
++}
++
++// BanRemoval is the payload of a BanDel raft entry. Two mutually exclusive
++// modes share one message type:
++//   - explicit unban: At is set, the ban generation is removed when its
++//     CreatedAt <= At, so a ban created after the unban request is preserved;
++//   - expiry cleanup: CreatedAt and ExpiresAt identify the exact generation
++//     observed by the sweeper, so a re-ban (different generation) is never
++//     deleted by a stale cleanup entry.
++type BanRemoval struct {
++	ClientID  string `json:"cid"`
++	At        int64  `json:"at,omitempty"` // explicit unban request time (unix nano)
++	CreatedAt int64  `json:"ct,omitempty"` // expiry cleanup: generation creation time
++	ExpiresAt int64  `json:"et,omitempty"` // expiry cleanup: generation expiry time
++}
++
++// BanBook is the replicated client-ban state machine. All mutating methods
++// are designed to be applied deterministically in raft log order on every
++// node, so retries, reordered proposals and expiry-cleanup/new-ban races
++// converge to the same result everywhere.
++type BanBook struct {
++	sync.RWMutex
++	bans map[string]Ban
++}
++
++func NewBanBook() *BanBook {
++	return &BanBook{bans: make(map[string]Ban)}
++}
++
++// Get returns the ban generation currently stored for the client.
++func (bk *BanBook) Get(clientID string) (Ban, bool) {
++	bk.RLock()
++	defer bk.RUnlock()
++	b, ok := bk.bans[clientID]
++	return b, ok
++}
++
++// All returns a copy of all stored ban generations (including expired ones
++// that have not been physically purged yet).
++func (bk *BanBook) All() []Ban {
++	bk.RLock()
++	defer bk.RUnlock()
++	out := make([]Ban, 0, len(bk.bans))
++	for _, b := range bk.bans {
++		out = append(out, b)
++	}
++	return out
++}
++
++// Put applies a ban generation. Stale proposals (older CreatedAt than the
++// stored generation) are ignored; equal CreatedAt is an idempotent retry.
++// Returns true when the stored generation changed or was confirmed.
++func (bk *BanBook) Put(b Ban) bool {
++	bk.Lock()
++	defer bk.Unlock()
++	if cur, ok := bk.bans[b.ClientID]; ok && cur.CreatedAt > b.CreatedAt {
++		return false
++	}
++	bk.bans[b.ClientID] = b
++	return true
++}
++
++// Remove applies an explicit unban: the stored generation is deleted only
++// when its CreatedAt <= notAfter (the unban request time), so a ban created
++// after the unban was requested survives a delayed/replayed unban entry.
++func (bk *BanBook) Remove(clientID string, notAfter int64) bool {
++	bk.Lock()
++	defer bk.Unlock()
++	cur, ok := bk.bans[clientID]
++	if !ok || cur.CreatedAt > notAfter {
++		return false
++	}
++	delete(bk.bans, clientID)
++	return true
++}
++
++// RemoveGeneration deletes a ban only when the stored generation matches the
++// exact (CreatedAt, ExpiresAt) pair observed by the expiry sweeper. A newer
++// re-ban therefore never gets purged by a stale cleanup entry.
++func (bk *BanBook) RemoveGeneration(clientID string, createdAt, expiresAt int64) bool {
++	bk.Lock()
++	defer bk.Unlock()
++	cur, ok := bk.bans[clientID]
++	if !ok || cur.CreatedAt != createdAt || cur.ExpiresAt != expiresAt {
++		return false
++	}
++	delete(bk.bans, clientID)
++	return true
++}
++
++// Snapshot returns a deep copy of the stored bans for raft snapshots.
++func (bk *BanBook) Snapshot() map[string]Ban {
++	bk.RLock()
++	defer bk.RUnlock()
++	cp := make(map[string]Ban, len(bk.bans))
++	for k, v := range bk.bans {
++		cp[k] = v
++	}
++	return cp
++}
++
++// Restore replaces the whole book with the snapshot state. A raft snapshot
++// holds the complete state up to its index, so existing entries are
++// discarded rather than merged.
++func (bk *BanBook) Restore(bans map[string]Ban) {
++	bk.Lock()
++	defer bk.Unlock()
++	if bans == nil {
++		bans = make(map[string]Ban)
++	}
++	bk.bans = bans
++}
+diff --git a/cluster/raft/etcd/kvstore.go b/cluster/raft/etcd/kvstore.go
+index 699978c..f779d9e 100644
+--- a/cluster/raft/etcd/kvstore.go
++++ b/cluster/raft/etcd/kvstore.go
+@@ -7,6 +7,8 @@ package etcd
+ import (
+ 	"bytes"
+ 	"encoding/gob"
++	"encoding/json"
++
+ 	"github.com/wind-c/comqtt/v2/cluster/log"
+ 	"github.com/wind-c/comqtt/v2/cluster/message"
+ 	base "github.com/wind-c/comqtt/v2/cluster/raft"
+@@ -19,6 +21,7 @@ import (
+ // KVStore is a key-value store backed by raft
+ type KVStore struct {
+ 	*base.KV
++	bans        *base.BanBook
+ 	snapshotter *snap.Snapshotter
+ 	commitC     <-chan *commit
+ 	errorC      <-chan error
+@@ -28,6 +31,7 @@ type KVStore struct {
+ func newKVStore(snapshotter *snap.Snapshotter, commitC <-chan *commit, errorC <-chan error, notifyCh chan<- *message.Message) *KVStore {
+ 	s := &KVStore{
+ 		KV:          base.NewKV(),
++		bans:        base.NewBanBook(),
+ 		snapshotter: snapshotter,
+ 		commitC:     commitC,
+ 		errorC:      errorC,
+@@ -56,6 +60,12 @@ func (s *KVStore) DelByNode(node string) int {
+ 	return s.DelByValue(node)
+ }
+ 
++// ListBans returns all replicated ban generations, including expired ones
++// not yet purged. Callers treat expired entries as inactive.
++func (s *KVStore) ListBans() []base.Ban {
++	return s.bans.All()
++}
++
+ func (s *KVStore) GetErrorC(key, value string) <-chan error {
+ 	return s.errorC
+ }
+@@ -84,14 +94,41 @@ func (s *KVStore) readCommits() {
+ 			}
+ 			filter := string(msg.Payload)
+ 			deliverable := false
+-			if msg.Type == packets.Subscribe {
++			switch {
++			case msg.Type == packets.Subscribe:
+ 				deliverable = s.Add(filter, msg.NodeID)
+-			} else if msg.Type == packets.Unsubscribe {
++				log.Info("raft apply", "from", msg.NodeID, "filter", filter, "type", msg.Type)
++			case msg.Type == packets.Unsubscribe:
+ 				deliverable = s.Del(filter, msg.NodeID)
+-			} else {
++				log.Info("raft apply", "from", msg.NodeID, "filter", filter, "type", msg.Type)
++			case msg.Type == message.BanAdd:
++				var ban base.Ban
++				if err := json.Unmarshal(msg.Payload, &ban); err != nil {
++					log.Error("[store] unmarshal ban", "error", err)
++					continue
++				}
++				s.bans.Put(ban)
++				log.Info("raft apply ban", "from", msg.NodeID, "cid", ban.ClientID, "expires", ban.ExpiresAt)
++				// ban notifications must reach every node (including the
++				// proposer) so the local mirror is updated and the banned
++				// client's live connection is torn down.
++				deliverable = true
++			case msg.Type == message.BanDel:
++				var rm base.BanRemoval
++				if err := json.Unmarshal(msg.Payload, &rm); err != nil {
++					log.Error("[store] unmarshal ban removal", "error", err)
++					continue
++				}
++				if rm.CreatedAt > 0 && rm.ExpiresAt > 0 {
++					s.bans.RemoveGeneration(rm.ClientID, rm.CreatedAt, rm.ExpiresAt)
++				} else {
++					s.bans.Remove(rm.ClientID, rm.At)
++				}
++				log.Info("raft apply unban", "from", msg.NodeID, "cid", rm.ClientID)
++				deliverable = true
++			default:
+ 				continue
+ 			}
+-			log.Info("raft apply", "from", msg.NodeID, "filter", filter, "type", msg.Type)
+ 			if s.notifyCh != nil && deliverable {
+ 				s.notifyCh <- &msg
+ 			}
+@@ -108,6 +145,14 @@ func (s *KVStore) getSnapshot() ([]byte, error) {
+ 	if err := gob.NewEncoder(&buffer).Encode(s.GetAll()); err != nil {
+ 		return nil, err
+ 	}
++	// bans are appended as a second gob object only when present, so that
++	// ban-free snapshots keep the exact historical format; older versions
++	// reading them (and readers hitting EOF) treat missing bans as empty.
++	if bans := s.bans.Snapshot(); len(bans) > 0 {
++		if err := gob.NewEncoder(&buffer).Encode(bans); err != nil {
++			return nil, err
++		}
++	}
+ 	return buffer.Bytes(), nil
+ }
+ 
+@@ -124,7 +169,10 @@ func (s *KVStore) loadSnapshot() (*raftpb.Snapshot, error) {
+ }
+ 
+ func (s *KVStore) recoverFromSnapshot(snapshot []byte) error {
+-	if err := s.KV.Restore(bytes.NewReader(snapshot)); err != nil {
++	reader := bytes.NewReader(snapshot)
++	// subscriptions map first, ban-policy map second (absent in old snapshots);
++	// a single decoder must read both because gob buffers its reads.
++	if err := s.KV.RestoreSnapshot(reader, s.bans); err != nil {
+ 		return err
+ 	}
+ 	s.notifyReplay()
+@@ -141,4 +189,17 @@ func (s *KVStore) notifyReplay() {
+ 		s.notifyCh <- &msg
+ 		log.Info("raft replay", "from", msg.NodeID, "filter", filter, "type", msg.Type)
+ 	}
++	for _, ban := range s.bans.All() {
++		payload, err := json.Marshal(ban)
++		if err != nil {
++			continue
++		}
++		msg := message.Message{
++			Type:     message.BanAdd,
++			ClientID: ban.ClientID,
++			Payload:  payload,
++		}
++		s.notifyCh <- &msg
++		log.Info("raft replay ban", "cid", ban.ClientID, "expires", ban.ExpiresAt)
++	}
+ }
+diff --git a/cluster/raft/etcd/kvstore_test.go b/cluster/raft/etcd/kvstore_test.go
+index dde9986..b65472f 100644
+--- a/cluster/raft/etcd/kvstore_test.go
++++ b/cluster/raft/etcd/kvstore_test.go
+@@ -13,7 +13,7 @@ import (
+ // the routing table has to be readable afterwards, and any state held
+ // before the snapshot must be discarded.
+ func TestKVStoreRecoverFromSnapshot(t *testing.T) {
+-	src := &KVStore{KV: base.NewKV()}
++	src := &KVStore{KV: base.NewKV(), bans: base.NewBanBook()}
+ 	src.Add("topic/a", "node1")
+ 	src.Add("topic/a", "node2")
+ 
+@@ -21,7 +21,7 @@ func TestKVStoreRecoverFromSnapshot(t *testing.T) {
+ 	require.NoError(t, err)
+ 
+ 	notifyCh := make(chan *message.Message, 8)
+-	dst := &KVStore{KV: base.NewKV(), notifyCh: notifyCh}
++	dst := &KVStore{KV: base.NewKV(), bans: base.NewBanBook(), notifyCh: notifyCh}
+ 	dst.Add("topic/stale", "nodeX")
+ 
+ 	require.NoError(t, dst.recoverFromSnapshot(snapshot))
+@@ -36,14 +36,50 @@ func TestKVStoreRecoverFromSnapshot(t *testing.T) {
+ 	require.Equal(t, "node1,node2", msg.NodeID)
+ }
+ 
++// Ban generations must travel with the snapshot so that nodes converging
++// after a restart/partition re-enforce the same policies, and the replay
++// must re-emit BanAdd notifications so downstream mirror/disconnect logic
++// is re-armed.
++func TestKVStoreSnapshotCarriesBans(t *testing.T) {
++	src := &KVStore{KV: base.NewKV(), bans: base.NewBanBook()}
++	src.Add("topic/a", "node1")
++	src.bans.Put(base.Ban{ClientID: "bad-client", Reason: "abuse", CreatedAt: 1000, ExpiresAt: 2000})
++	src.bans.Put(base.Ban{ClientID: "forever", CreatedAt: 1001, ExpiresAt: base.BanExpiresNever})
++
++	snapshot, err := src.getSnapshot()
++	require.NoError(t, err)
++
++	notifyCh := make(chan *message.Message, 16)
++	dst := &KVStore{KV: base.NewKV(), bans: base.NewBanBook(), notifyCh: notifyCh}
++	require.NoError(t, dst.recoverFromSnapshot(snapshot))
++
++	b, ok := dst.bans.Get("bad-client")
++	require.True(t, ok)
++	require.Equal(t, int64(2000), b.ExpiresAt)
++	b2, ok := dst.bans.Get("forever")
++	require.True(t, ok)
++	require.True(t, b2.Permanent())
++
++	// replays cover both subscriptions and ban generations
++	var types []byte
++	for len(notifyCh) > 0 {
++		msg := <-notifyCh
++		if msg.Type == message.BanAdd {
++			types = append(types, byte(len(msg.Payload)))
++			require.NotEmpty(t, msg.ClientID)
++		}
++	}
++	require.Len(t, types, 2, "both bans must be replayed")
++}
++
+ // A corrupt snapshot must leave the existing state untouched.
+ func TestKVStoreRecoverFromCorruptSnapshot(t *testing.T) {
+-	src := &KVStore{KV: base.NewKV()}
++	src := &KVStore{KV: base.NewKV(), bans: base.NewBanBook()}
+ 	src.Add("topic/a", "node1")
+ 	snapshot, err := src.getSnapshot()
+ 	require.NoError(t, err)
+ 
+-	dst := &KVStore{KV: base.NewKV()}
++	dst := &KVStore{KV: base.NewKV(), bans: base.NewBanBook()}
+ 	dst.Add("topic/b", "node2")
+ 
+ 	require.Error(t, dst.recoverFromSnapshot(snapshot[:len(snapshot)/2]))
+diff --git a/cluster/raft/etcd/peer.go b/cluster/raft/etcd/peer.go
+index 0a3e446..b950cdd 100644
+--- a/cluster/raft/etcd/peer.go
++++ b/cluster/raft/etcd/peer.go
+@@ -18,6 +18,7 @@ import (
+ 
+ 	"github.com/wind-c/comqtt/v2/cluster/log"
+ 	"github.com/wind-c/comqtt/v2/cluster/message"
++	base "github.com/wind-c/comqtt/v2/cluster/raft"
+ 	"github.com/wind-c/comqtt/v2/config"
+ 	"go.uber.org/zap"
+ 	"go.uber.org/zap/zapcore"
+@@ -196,6 +197,11 @@ func (p *Peer) Lookup(key string) []string {
+ 	return rs
+ }
+ 
++// ListBans returns all ban generations replicated through raft.
++func (p *Peer) ListBans() []base.Ban {
++	return p.kvStore.ListBans()
++}
++
+ func (p *Peer) DelByNode(node string) int {
+ 	return p.kvStore.DelByNode(node)
+ }
+diff --git a/cluster/raft/hashicorp/fsm.go b/cluster/raft/hashicorp/fsm.go
+index aabafff..42f5842 100644
+--- a/cluster/raft/hashicorp/fsm.go
++++ b/cluster/raft/hashicorp/fsm.go
+@@ -7,6 +7,7 @@ package hashicorp
+ import (
+ 	"bytes"
+ 	"encoding/gob"
++	"encoding/json"
+ 	"io"
+ 	"strings"
+ 
+@@ -19,12 +20,14 @@ import (
+ 
+ type Fsm struct {
+ 	*base.KV
++	bans     *base.BanBook
+ 	notifyCh chan<- *message.Message
+ }
+ 
+ func NewFsm(notifyCh chan<- *message.Message) *Fsm {
+ 	fsm := &Fsm{
+ 		KV:       base.NewKV(),
++		bans:     base.NewBanBook(),
+ 		notifyCh: notifyCh,
+ 	}
+ 	return fsm
+@@ -37,14 +40,40 @@ func (f *Fsm) Apply(l *raft.Log) interface{} {
+ 	}
+ 	filter := string(msg.Payload)
+ 	deliverable := false
+-	if msg.Type == packets.Subscribe {
++	switch {
++	case msg.Type == packets.Subscribe:
+ 		deliverable = f.Add(filter, msg.NodeID)
+-	} else if msg.Type == packets.Unsubscribe {
++		log.Info("raft apply", "from", msg.NodeID, "filter", filter, "type", msg.Type)
++	case msg.Type == packets.Unsubscribe:
+ 		deliverable = f.Del(filter, msg.NodeID)
+-	} else {
++		log.Info("raft apply", "from", msg.NodeID, "filter", filter, "type", msg.Type)
++	case msg.Type == message.BanAdd:
++		var ban base.Ban
++		if err := json.Unmarshal(msg.Payload, &ban); err != nil {
++			log.Error("raft apply ban unmarshal", "error", err)
++			return nil
++		}
++		f.bans.Put(ban)
++		log.Info("raft apply ban", "from", msg.NodeID, "cid", ban.ClientID, "expires", ban.ExpiresAt)
++		// ban notifications must reach every node (including the proposer)
++		// so the local mirror is updated and the live connection is torn down.
++		deliverable = true
++	case msg.Type == message.BanDel:
++		var rm base.BanRemoval
++		if err := json.Unmarshal(msg.Payload, &rm); err != nil {
++			log.Error("raft apply unban unmarshal", "error", err)
++			return nil
++		}
++		if rm.CreatedAt > 0 && rm.ExpiresAt > 0 {
++			f.bans.RemoveGeneration(rm.ClientID, rm.CreatedAt, rm.ExpiresAt)
++		} else {
++			f.bans.Remove(rm.ClientID, rm.At)
++		}
++		log.Info("raft apply unban", "from", msg.NodeID, "cid", rm.ClientID)
++		deliverable = true
++	default:
+ 		return nil
+ 	}
+-	log.Info("raft apply", "from", msg.NodeID, "filter", filter, "type", msg.Type)
+ 	if f.notifyCh != nil && deliverable {
+ 		select {
+ 		case f.notifyCh <- &msg:
+@@ -60,6 +89,12 @@ func (f *Fsm) Lookup(key string) []string {
+ 	return f.Get(key)
+ }
+ 
++// ListBans returns all replicated ban generations, including expired ones
++// not yet purged. Callers treat expired entries as inactive.
++func (f *Fsm) ListBans() []base.Ban {
++	return f.bans.All()
++}
++
+ func (f *Fsm) DelByNode(node string) int {
+ 	return f.DelByValue(node)
+ }
+@@ -69,7 +104,9 @@ func (f *Fsm) Snapshot() (raft.FSMSnapshot, error) {
+ }
+ 
+ func (f *Fsm) Restore(ir io.ReadCloser) error {
+-	if err := f.KV.Restore(ir); err != nil {
++	// subscriptions map first, ban-policy map second (absent in old snapshots);
++	// a single decoder must read both because gob buffers its reads.
++	if err := f.KV.RestoreSnapshot(ir, f.bans); err != nil {
+ 		return err
+ 	}
+ 	f.notifyReplay()
+@@ -86,17 +123,37 @@ func (f *Fsm) notifyReplay() {
+ 		f.notifyCh <- &msg
+ 		log.Info("raft replay", "from", msg.NodeID, "filter", filter, "type", msg.Type)
+ 	}
++	for _, ban := range f.bans.All() {
++		payload, err := json.Marshal(ban)
++		if err != nil {
++			continue
++		}
++		msg := message.Message{
++			Type:     message.BanAdd,
++			ClientID: ban.ClientID,
++			Payload:  payload,
++		}
++		f.notifyCh <- &msg
++		log.Info("raft replay ban", "cid", ban.ClientID, "expires", ban.ExpiresAt)
++	}
+ }
+ 
+ func (f *Fsm) Persist(sink raft.SnapshotSink) error {
+ 	var buffer bytes.Buffer
+-	err := gob.NewEncoder(&buffer).Encode(f.GetAll())
+-	if err != nil {
++	if err := gob.NewEncoder(&buffer).Encode(f.GetAll()); err != nil {
+ 		return err
+ 	}
+-	sink.Write(buffer.Bytes())
+-	sink.Close()
+-	return nil
++	// bans are appended as a second gob object only when present, so that
++	// ban-free snapshots keep the exact historical format.
++	if bans := f.bans.Snapshot(); len(bans) > 0 {
++		if err := gob.NewEncoder(&buffer).Encode(bans); err != nil {
++			return err
++		}
++	}
++	if _, err := sink.Write(buffer.Bytes()); err != nil {
++		return err
++	}
++	return sink.Close()
+ }
+ 
+ func (f *Fsm) Release() {}
+diff --git a/cluster/raft/hashicorp/fsm_test.go b/cluster/raft/hashicorp/fsm_test.go
+index 6e0d143..b94668d 100644
+--- a/cluster/raft/hashicorp/fsm_test.go
++++ b/cluster/raft/hashicorp/fsm_test.go
+@@ -2,11 +2,14 @@ package hashicorp
+ 
+ import (
+ 	"bytes"
++	"encoding/json"
+ 	"io"
+ 	"testing"
+ 
++	"github.com/hashicorp/raft"
+ 	"github.com/stretchr/testify/require"
+ 	"github.com/wind-c/comqtt/v2/cluster/message"
++	base "github.com/wind-c/comqtt/v2/cluster/raft"
+ 	"github.com/wind-c/comqtt/v2/mqtt/packets"
+ )
+ 
+@@ -53,6 +56,41 @@ func TestFsmSnapshotRestoreRoundTrip(t *testing.T) {
+ 	}
+ }
+ 
++// Ban generations must be persisted in the snapshot and replayed when
++// restored, so that restarted/caught-up nodes converge to the same policies.
++func TestFsmSnapshotBansRoundTrip(t *testing.T) {
++	src := NewFsm(nil)
++	src.Add("topic/a", "node1")
++	payload, err := json.Marshal(base.Ban{ClientID: "bad-client", Reason: "abuse", CreatedAt: 1000, ExpiresAt: 2000})
++	require.NoError(t, err)
++	m := message.Message{Type: message.BanAdd, ClientID: "bad-client", Payload: payload}
++	src.Apply(&raft.Log{Data: m.MsgpackBytes()})
++
++	snap, err := src.Snapshot()
++	require.NoError(t, err)
++	sink := new(testSnapshotSink)
++	require.NoError(t, snap.Persist(sink))
++
++	notifyCh := make(chan *message.Message, 16)
++	dst := NewFsm(notifyCh)
++	require.NoError(t, dst.Restore(io.NopCloser(bytes.NewReader(sink.Bytes()))))
++
++	b, ok := dst.bans.Get("bad-client")
++	require.True(t, ok)
++	require.Equal(t, "abuse", b.Reason)
++	require.Equal(t, int64(2000), b.ExpiresAt)
++
++	var banReplays int
++	for len(notifyCh) > 0 {
++		msg := <-notifyCh
++		if msg.Type == message.BanAdd {
++			banReplays++
++			require.Equal(t, "bad-client", msg.ClientID)
++		}
++	}
++	require.Equal(t, 1, banReplays)
++}
++
+ // A corrupt snapshot must leave the existing state untouched.
+ func TestFsmRestoreCorruptSnapshot(t *testing.T) {
+ 	src := NewFsm(nil)
+diff --git a/cluster/raft/hashicorp/peer.go b/cluster/raft/hashicorp/peer.go
+index c7476f3..c951264 100644
+--- a/cluster/raft/hashicorp/peer.go
++++ b/cluster/raft/hashicorp/peer.go
+@@ -16,6 +16,7 @@ import (
+ 
+ 	"github.com/wind-c/comqtt/v2/cluster/log"
+ 	"github.com/wind-c/comqtt/v2/cluster/message"
++	base "github.com/wind-c/comqtt/v2/cluster/raft"
+ 	"github.com/wind-c/comqtt/v2/cluster/utils"
+ 	"github.com/wind-c/comqtt/v2/config"
+ 
+@@ -225,6 +226,11 @@ func (p *Peer) Lookup(key string) []string {
+ 	return p.fsm.Lookup(key)
+ }
+ 
++// ListBans returns all ban generations replicated through raft.
++func (p *Peer) ListBans() []base.Ban {
++	return p.fsm.ListBans()
++}
++
+ func (p *Peer) DelByNode(node string) int {
+ 	return p.fsm.DelByNode(node)
+ }
+diff --git a/cluster/rest/rest.go b/cluster/rest/rest.go
+index 14c7041..c1c5d22 100644
+--- a/cluster/rest/rest.go
++++ b/cluster/rest/rest.go
+@@ -6,9 +6,11 @@ import (
+ 	cs "github.com/wind-c/comqtt/v2/cluster"
+ 	"github.com/wind-c/comqtt/v2/cluster/discovery"
+ 	rt "github.com/wind-c/comqtt/v2/mqtt/rest"
++	"io"
+ 	"net/http"
+ 	"net/netip"
+ 	"strings"
++	"time"
+ )
+ 
+ type rest struct {
+@@ -37,6 +39,9 @@ func (s *rest) GenHandlers() map[string]rt.Handler {
+ 		"GET /api/v1/cluster/stat/overall":      s.getOverall,
+ 		"POST /api/v1/cluster/blacklist/{id}":   s.kickClient,
+ 		"DELETE /api/v1/cluster/blacklist/{id}": s.blanchClient,
++		"GET /api/v1/cluster/bans":             s.getBans,
++		"POST /api/v1/cluster/bans/{id}":       s.addBan,
++		"DELETE /api/v1/cluster/bans/{id}":     s.delBan,
+ 	}
+ }
+ 
+@@ -171,6 +176,69 @@ func (s *rest) blanchClient(w http.ResponseWriter, r *http.Request) {
+ 	rt.Ok(w, rs)
+ }
+ 
++// banRequest is the optional body of POST /cluster/bans/{id}.
++type banRequest struct {
++	TTLSeconds int64  `json:"ttl_seconds"`
++	Reason     string `json:"reason"`
++}
++
++// getBans returns the cluster-wide ban policies (temporary and permanent)
++// replicated through raft, including remaining time of temporary bans.
++// GET api/v1/cluster/bans
++func (s *rest) getBans(w http.ResponseWriter, r *http.Request) {
++	rt.Ok(w, s.agent.BanList())
++}
++
++// addBan replicates a ban for the client id across the cluster. ttl_seconds
++// == 0 (or an empty body) means permanent; positive ttl_seconds creates a
++// temporary ban that is rejected by every node until it expires. The ban is
++// durable through raft, so it survives node restarts and nodes that were
++// briefly offline converge to the same generation when they catch up.
++// POST api/v1/cluster/bans/{id}
++func (s *rest) addBan(w http.ResponseWriter, r *http.Request) {
++	cid := r.PathValue("id")
++	if cid == "" {
++		rt.Error(w, http.StatusBadRequest, "client id is required")
++		return
++	}
++
++	var req banRequest
++	if r.Body != nil {
++		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
++			rt.Error(w, http.StatusBadRequest, err.Error())
++			return
++		}
++	}
++	if req.TTLSeconds < 0 {
++		rt.Error(w, http.StatusBadRequest, "ttl_seconds must be greater than or equal to 0")
++		return
++	}
++
++	policy, err := s.agent.BanClient(cid, req.Reason, time.Duration(req.TTLSeconds)*time.Second)
++	if err != nil {
++		// a timeout does not prove the proposal failed; the caller may
++		// retry - re-proposing a ban never weakens the policy
++		rt.Error(w, http.StatusInternalServerError, err.Error())
++		return
++	}
++	rt.Ok(w, policy)
++}
++
++// delBan removes the ban policy for the client id across the cluster.
++// DELETE api/v1/cluster/bans/{id}
++func (s *rest) delBan(w http.ResponseWriter, r *http.Request) {
++	cid := r.PathValue("id")
++	if cid == "" {
++		rt.Error(w, http.StatusBadRequest, "client id is required")
++		return
++	}
++	if err := s.agent.UnbanClient(cid); err != nil {
++		rt.Error(w, http.StatusInternalServerError, err.Error())
++		return
++	}
++	rt.Ok(w, map[string]string{"id": cid})
++}
++
+ func (s *rest) getClients(w http.ResponseWriter, r *http.Request) {
+ 	path := rt.MqttGetClientsPath + "?" + r.URL.RawQuery
+ 	urls := genUrls(s.agent.GetMemberList(), path)
+diff --git a/dashboard/dashboard.go b/dashboard/dashboard.go
+index f7dae05..8db9500 100644
+--- a/dashboard/dashboard.go
++++ b/dashboard/dashboard.go
+@@ -112,6 +112,7 @@ func (d *Dashboard) Routes() http.Handler {
+ 	protected.HandleFunc("GET /dashboard/publish", d.servePage("publish"))
+ 	protected.HandleFunc("GET /dashboard/auth", d.servePage("auth"))
+ 	protected.HandleFunc("GET /dashboard/acl", d.servePage("acl"))
++	protected.HandleFunc("GET /dashboard/bans", d.servePage("bans"))
+ 	protected.HandleFunc("POST /dashboard/profile/password", d.HandleChangePassword)
+ 
+ 	mux.Handle("/dashboard/", d.AuthMiddleware(protected))
+diff --git a/dashboard/templates/bans.html b/dashboard/templates/bans.html
+new file mode 100644
+index 0000000..73488eb
+--- /dev/null
++++ b/dashboard/templates/bans.html
+@@ -0,0 +1,98 @@
++{{define "bans"}}{{template "layout" .}}{{end}}
++{{define "title"}}Client Bans{{end}}
++{{define "content"}}
++<div id="bans-area">
++<div class="card" style="margin-bottom:16px">
++  <div class="card-label">Temporary / permanent client ban</div>
++  <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
++    <div style="flex:2;min-width:180px"><label style="font-size:0.75rem;color:var(--text-muted)">Client ID</label><input id="ban-cid" type="text" placeholder="client id to ban"></div>
++    <div style="flex:1;min-width:140px"><label style="font-size:0.75rem;color:var(--text-muted)">Duration</label>
++      <select id="ban-ttl">
++        <option value="900">15 minutes</option>
++        <option value="3600" selected>1 hour</option>
++        <option value="21600">6 hours</option>
++        <option value="86400">24 hours</option>
++        <option value="604800">7 days</option>
++        <option value="0">Permanent</option>
++      </select>
++    </div>
++    <div style="flex:2;min-width:180px"><label style="font-size:0.75rem;color:var(--text-muted)">Reason (optional)</label><input id="ban-reason" type="text" placeholder="e.g. abuse"></div>
++    <div><button class="btn btn-danger" onclick="submitBan()">Ban client</button></div>
++  </div>
++</div>
++<table><thead><tr>
++  <th>Client ID</th><th>Type</th><th>Reason</th><th>Created</th><th>Expires</th><th>Remaining</th><th></th>
++</tr></thead><tbody id="bans-tbody"></tbody></table>
++<div class="text-muted" id="bans-empty" style="padding:12px 0;display:none">No active ban policies.</div>
++</div>
++<script>
++(function(){
++var API = '{{if .IsCluster}}/api/v1/cluster/bans{{else}}/api/v1/mqtt/bans{{end}}';
++var bans = [];
++function fmtRemaining(p){
++  if(p.permanent || p.remaining_seconds < 0) return 'Permanent';
++  var s = p.remaining_seconds;
++  if(s <= 0) return 'expired';
++  var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60, out=[];
++  if(d) out.push(d+'d'); if(h) out.push(h+'h'); if(m) out.push(m+'m');
++  if(!d&&!h) out.push(sec+'s');
++  return out.join(' ');
++}
++function render(){
++  var html = bans.map(function(p){
++    var typ = p.permanent
++      ? '<span class="tag" style="color:var(--danger)">Permanent</span>'
++      : '<span class="tag tag-accent">Temporary</span>';
++    return '<tr><td class="mono">'+esc(p.client_id)+'</td>'+
++      '<td>'+typ+'</td>'+
++      '<td>'+esc(p.reason||'-')+'</td>'+
++      '<td>'+fmtTime(p.created_at)+'</td>'+
++      '<td>'+(p.expires_at ? fmtTime(p.expires_at) : '-')+'</td>'+
++      '<td class="mono" data-cid="'+esc(p.client_id)+'">'+fmtRemaining(p)+'</td>'+
++      '<td><button class="btn btn-danger" onclick="unban(\''+esc(encodeURIComponent(p.client_id))+'\')">Unban</button></td></tr>';
++  }).join('');
++  document.getElementById('bans-tbody').innerHTML = html;
++  document.getElementById('bans-empty').style.display = bans.length ? 'none' : 'block';
++}
++function load(){
++  api(API).then(function(data){
++    bans = data || [];
++    render();
++  }).catch(function(){ /* keep previous list on transient errors */ });
++}
++window.submitBan=function(){
++  var cid = document.getElementById('ban-cid').value.trim();
++  if(!cid){ showToast('Client ID is required','error'); return; }
++  var body = {
++    ttl_seconds: parseInt(document.getElementById('ban-ttl').value||'0',10),
++    reason: document.getElementById('ban-reason').value.trim()
++  };
++  api(API+'/'+encodeURIComponent(cid), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
++    .then(function(){
++      document.getElementById('ban-cid').value='';
++      document.getElementById('ban-reason').value='';
++      showToast('Ban applied for '+cid, 'success');
++      load();
++    })
++    .catch(function(err){ showToast('Ban failed: '+err.message,'error'); });
++};
++window.unban=function(cid){
++  api(API+'/'+cid, {method:'DELETE'}).then(function(){
++    showToast('Ban removed','success');
++    load();
++  }).catch(function(err){ showToast('Unban failed: '+err.message,'error'); });
++};
++load();
++setInterval(load, 10000);
++// local countdown tick without hitting the API
++setInterval(function(){
++  bans.forEach(function(p){
++    if(p.permanent || p.remaining_seconds < 0) return;
++    if(p.remaining_seconds > 0) p.remaining_seconds--;
++    var cell = document.querySelector('td[data-cid="'+CSS.escape(p.client_id)+'"]');
++    if(cell) cell.textContent = fmtRemaining(p);
++  });
++}, 1000);
++})();
++</script>
++{{end}}
+diff --git a/dashboard/templates/layout.html b/dashboard/templates/layout.html
+index 4d90eec..26adfa3 100644
+--- a/dashboard/templates/layout.html
++++ b/dashboard/templates/layout.html
+@@ -121,6 +121,7 @@ table.w-full { overflow-x: auto; display: block; }
+         <div class="sidebar-group">Access Control</div>
+         <a href="/dashboard/auth">Auth</a>
+         <a href="/dashboard/acl">ACL</a>
++        <a href="/dashboard/bans">Client Bans</a>
+         <div class="sidebar-divider"></div>
+         <div class="sidebar-group">Data</div>
+         <a href="/dashboard/subscriptions">Subscriptions</a>
+diff --git a/mqtt/bans.go b/mqtt/bans.go
+new file mode 100644
+index 0000000..4f252af
+--- /dev/null
++++ b/mqtt/bans.go
+@@ -0,0 +1,213 @@
++// SPDX-License-Identifier: MIT
++// SPDX-FileContributor: wind (573966@qq.com)
++
++package mqtt
++
++import (
++	"sort"
++	"sync"
++	"time"
++)
++
++// BanPolicy is the external, JSON-serializable view of a client ban.
++// Timestamps are unix seconds for the management API/UI; the internal book
++// keeps nanosecond precision so concurrent actions within the same second
++// stay ordered.
++type BanPolicy struct {
++	ClientID  string `json:"client_id"`
++	Reason    string `json:"reason,omitempty"`
++	Permanent bool   `json:"permanent"`
++	CreatedAt int64  `json:"created_at"`        // unix seconds
++	ExpiresAt int64  `json:"expires_at"`        // unix seconds, 0 when permanent
++	Remaining int64  `json:"remaining_seconds"` // -1 permanent; otherwise seconds left
++}
++
++// banEntry is one ban generation. Timestamps are unix nanoseconds;
++// expiresAt == 0 means the ban is permanent.
++type banEntry struct {
++	reason    string
++	createdAt int64
++	expiresAt int64
++}
++
++// banBook holds client ban generations. It is the enforcement point used by
++// every deployment: standalone mode writes it directly through the REST
++// handlers, while cluster mode mirrors raft-committed generations into it
++// via ApplyBan/ApplyBanRemoval/RemoveBanGeneration. All writes are
++// compare-and-swap style so retries, reordered proposals and expiry-cleanup
++// races converge to the same result.
++type banBook struct {
++	mu   sync.RWMutex
++	bans map[string]banEntry
++}
++
++func newBanBook() *banBook {
++	return &banBook{bans: make(map[string]banEntry)}
++}
++
++// put stores a ban generation unless a newer one already exists. Equal
++// createdAt is treated as an idempotent retry.
++func (bk *banBook) put(clientID, reason string, createdAt, expiresAt int64) bool {
++	bk.mu.Lock()
++	defer bk.mu.Unlock()
++	if cur, ok := bk.bans[clientID]; ok && cur.createdAt > createdAt {
++		return false
++	}
++	bk.bans[clientID] = banEntry{reason: reason, createdAt: createdAt, expiresAt: expiresAt}
++	return true
++}
++
++// remove deletes the generation for clientID unless it was created after
++// notAfter (an explicit unban request time, unix nano).
++func (bk *banBook) remove(clientID string, notAfter int64) bool {
++	bk.mu.Lock()
++	defer bk.mu.Unlock()
++	cur, ok := bk.bans[clientID]
++	if !ok || cur.createdAt > notAfter {
++		return false
++	}
++	delete(bk.bans, clientID)
++	return true
++}
++
++// removeGeneration deletes a ban only when the stored generation matches the
++// exact (createdAt, expiresAt) pair, so a stale expiry cleanup never purges a
++// newer re-ban.
++func (bk *banBook) removeGeneration(clientID string, createdAt, expiresAt int64) bool {
++	bk.mu.Lock()
++	defer bk.mu.Unlock()
++	cur, ok := bk.bans[clientID]
++	if !ok || cur.createdAt != createdAt || cur.expiresAt != expiresAt {
++		return false
++	}
++	delete(bk.bans, clientID)
++	return true
++}
++
++// banned reports whether the client is currently banned. Expired temporary
++// bans are treated as inactive (lazy expiry).
++func (bk *banBook) banned(clientID string, now int64) bool {
++	bk.mu.RLock()
++	defer bk.mu.RUnlock()
++	cur, ok := bk.bans[clientID]
++	return ok && (cur.expiresAt == 0 || now < cur.expiresAt)
++}
++
++// list returns the active (non-expired) ban generations, sorted by client id
++// for stable API output.
++func (bk *banBook) list(now int64) []BanPolicy {
++	bk.mu.RLock()
++	defer bk.mu.RUnlock()
++	out := make([]BanPolicy, 0, len(bk.bans))
++	for cid, e := range bk.bans {
++		if e.expiresAt != 0 && now >= e.expiresAt {
++			continue
++		}
++		p := BanPolicy{
++			ClientID:  cid,
++			Reason:    e.reason,
++			Permanent: e.expiresAt == 0,
++			CreatedAt: e.createdAt / int64(time.Second),
++			ExpiresAt: e.expiresAt / int64(time.Second),
++			Remaining: -1,
++		}
++		if e.expiresAt != 0 {
++			p.Remaining = (e.expiresAt - now) / int64(time.Second)
++			if p.Remaining < 0 {
++				p.Remaining = 0
++			}
++		}
++		out = append(out, p)
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].ClientID < out[j].ClientID })
++	return out
++}
++
++// sweep physically removes expired temporary generations. Permanent bans and
++// future-dated generations are left untouched, so a concurrent re-ban can
++// never be purged.
++func (bk *banBook) sweep(now int64) int {
++	bk.mu.Lock()
++	defer bk.mu.Unlock()
++	c := 0
++	for cid, e := range bk.bans {
++		if e.expiresAt != 0 && now >= e.expiresAt {
++			delete(bk.bans, cid)
++			c++
++		}
++	}
++	return c
++}
++
++// BanClient adds a local ban for the client and returns its policy. A ttl <= 0
++// means permanent. Used directly in standalone mode and for node-local REST
++// calls; cluster mode applies raft-committed generations via ApplyBan.
++func (s *Server) BanClient(clientID, reason string, ttl time.Duration) BanPolicy {
++	now := time.Now()
++	createdAt := now.UnixNano()
++	expiresAt := int64(0)
++	if ttl > 0 {
++		expiresAt = now.Add(ttl).UnixNano()
++	}
++	s.bans.put(clientID, reason, createdAt, expiresAt)
++	return banPolicy(clientID, reason, createdAt, expiresAt, now.UnixNano())
++}
++
++// UnbanClient explicitly removes the ban generation for the client.
++// Returns true when a generation was removed.
++func (s *Server) UnbanClient(clientID string) bool {
++	return s.bans.remove(clientID, time.Now().UnixNano())
++}
++
++// IsBanned reports whether the client currently has an active ban.
++func (s *Server) IsBanned(clientID string) bool {
++	return s.bans.banned(clientID, time.Now().UnixNano())
++}
++
++// BanList returns all active ban policies with remaining time.
++func (s *Server) BanList() []BanPolicy {
++	return s.bans.list(time.Now().UnixNano())
++}
++
++// ApplyBan mirrors a raft-committed ban generation into the local book.
++func (s *Server) ApplyBan(clientID, reason string, createdAt, expiresAt int64) bool {
++	return s.bans.put(clientID, reason, createdAt, expiresAt)
++}
++
++// ApplyBanRemoval mirrors a raft-committed explicit unban. notAfter is the
++// unban request time (unix nano); generations created later are preserved.
++func (s *Server) ApplyBanRemoval(clientID string, notAfter int64) bool {
++	return s.bans.remove(clientID, notAfter)
++}
++
++// RemoveBanGeneration mirrors a raft-committed expiry cleanup; it only removes
++// the exact generation identified by (createdAt, expiresAt).
++func (s *Server) RemoveBanGeneration(clientID string, createdAt, expiresAt int64) bool {
++	return s.bans.removeGeneration(clientID, createdAt, expiresAt)
++}
++
++// sweepBans physically purges expired temporary ban generations. In cluster
++// mode the raft log remains authoritative: a purged mirror entry is either
++// re-confirmed by the leader's replicated cleanup or re-added by a newer ban,
++// and enforcement while expired is identical to no entry.
++func (s *Server) sweepBans(now int64) int {
++	return s.bans.sweep(now)
++}
++
++func banPolicy(clientID, reason string, createdAt, expiresAt, now int64) BanPolicy {
++	p := BanPolicy{
++		ClientID:  clientID,
++		Reason:    reason,
++		Permanent: expiresAt == 0,
++		CreatedAt: createdAt / int64(time.Second),
++		ExpiresAt: expiresAt / int64(time.Second),
++		Remaining: -1,
++	}
++	if expiresAt != 0 {
++		p.Remaining = (expiresAt - now) / int64(time.Second)
++		if p.Remaining < 0 {
++			p.Remaining = 0
++		}
++	}
++	return p
++}
+diff --git a/mqtt/bans_test.go b/mqtt/bans_test.go
+new file mode 100644
+index 0000000..a0e98d0
+--- /dev/null
++++ b/mqtt/bans_test.go
+@@ -0,0 +1,171 @@
++// SPDX-License-Identifier: MIT
++// SPDX-FileContributor: wind (573966@qq.com)
++
++package mqtt
++
++import (
++	"io"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++	"github.com/wind-c/comqtt/v2/mqtt/packets"
++)
++
++func TestServerBanClientTemporary(t *testing.T) {
++	s := newServer()
++	defer s.Close()
++
++	p := s.BanClient("temp-1", "abuse", time.Minute)
++	require.Equal(t, "temp-1", p.ClientID)
++	require.False(t, p.Permanent)
++	require.Equal(t, int64(60), p.Remaining)
++	require.True(t, s.IsBanned("temp-1"))
++	require.False(t, s.IsBanned("other"))
++
++	list := s.BanList()
++	require.Len(t, list, 1)
++	require.Equal(t, "abuse", list[0].Reason)
++
++	require.True(t, s.UnbanClient("temp-1"))
++	require.False(t, s.IsBanned("temp-1"))
++	require.Len(t, s.BanList(), 0)
++	// unban is idempotent
++	require.False(t, s.UnbanClient("temp-1"))
++}
++
++func TestServerBanClientPermanent(t *testing.T) {
++	s := newServer()
++	defer s.Close()
++
++	p := s.BanClient("forever", "", 0)
++	require.True(t, p.Permanent)
++	require.Equal(t, int64(-1), p.Remaining)
++	require.True(t, s.IsBanned("forever"))
++	require.Len(t, s.BanList(), 1)
++}
++
++func TestServerBanExpiryLazyAndSweep(t *testing.T) {
++	s := newServer()
++	defer s.Close()
++
++	now := time.Now().UnixNano()
++	s.ApplyBan("gone", "old", now-2_000_000_000, now-1_000_000_000)    // expired 1s ago
++	s.ApplyBan("stay", "fresh", now, now+10_000_000_000)               // active for 10s
++	s.ApplyBan("forever", "perm", now-5_000_000_000, 0)                // permanent
++
++	// expired generations are not enforced even before physical removal
++	require.False(t, s.IsBanned("gone"))
++	require.True(t, s.IsBanned("stay"))
++	require.True(t, s.IsBanned("forever"))
++
++	// the API only lists active policies
++	require.Len(t, s.BanList(), 2)
++
++	// sweep purges only expired temporary generations
++	require.Equal(t, 1, s.sweepBans(now))
++	require.False(t, s.IsBanned("gone"))
++	require.True(t, s.IsBanned("stay"))
++	require.True(t, s.IsBanned("forever"))
++
++	// a stale generation cleanup never purges a newer re-ban
++	require.False(t, s.RemoveBanGeneration("stay", now-9_000_000_000, now-8_000_000_000))
++	require.True(t, s.IsBanned("stay"))
++	require.True(t, s.RemoveBanGeneration("stay", now, now+10_000_000_000))
++	require.False(t, s.IsBanned("stay"))
++}
++
++func TestServerApplyBanCAS(t *testing.T) {
++	s := newServer()
++	defer s.Close()
++
++	now := time.Now().UnixNano()
++	s.ApplyBan("c", "new", now, now+10_000_000_000)
++	// a stale raft entry (older generation) must not downgrade the policy
++	s.ApplyBan("c", "old", now-5_000_000_000, now-4_000_000_000)
++	require.True(t, s.IsBanned("c"))
++	list := s.BanList()
++	require.Len(t, list, 1)
++	require.Equal(t, "new", list[0].Reason)
++
++	// an unban requested before this ban was created must not remove it
++	s.ApplyBanRemoval("c", now-6_000_000_000)
++	require.True(t, s.IsBanned("c"))
++
++	// unban requested afterwards removes it
++	s.ApplyBanRemoval("c", now+1_000_000_000)
++	require.False(t, s.IsBanned("c"))
++}
++
++func TestEstablishConnectionBannedRejected(t *testing.T) {
++	s := newServer()
++	defer s.Close()
++
++	cid := packets.TPacketData[packets.Connect].Get(packets.TConnectClean).Packet.Connect.ClientIdentifier
++	require.NotEmpty(t, cid)
++	s.BanClient(cid, "test ban", time.Minute)
++
++	r, w := net.Pipe()
++	o := make(chan error, 1)
++	go func() {
++		o <- s.EstablishConnection("tcp", r)
++	}()
++
++	go func() {
++		_, _ = w.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectClean).RawBytes)
++	}()
++
++	recv := make(chan []byte, 1)
++	go func() {
++		buf, err := io.ReadAll(w)
++		require.NoError(t, err)
++		recv <- buf
++	}()
++
++	err := <-o
++	require.Error(t, err)
++	require.Contains(t, err.Error(), "banned client")
++
++	// a banned connection is closed without a connack
++	require.Empty(t, <-recv)
++
++	_ = w.Close()
++	_ = r.Close()
++}
++
++func TestEstablishConnectionAfterUnbanAccepted(t *testing.T) {
++	s := newServer()
++	defer s.Close()
++
++	cid := packets.TPacketData[packets.Connect].Get(packets.TConnectClean).Packet.Connect.ClientIdentifier
++	s.BanClient(cid, "test ban", time.Millisecond)
++	require.True(t, s.IsBanned(cid))
++	// after expiry the client is no longer rejected
++	time.Sleep(5 * time.Millisecond)
++	require.False(t, s.IsBanned(cid))
++
++	r, w := net.Pipe()
++	o := make(chan error, 1)
++	go func() {
++		o <- s.EstablishConnection("tcp", r)
++	}()
++
++	go func() {
++		_, _ = w.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectClean).RawBytes)
++		_, _ = w.Write(packets.TPacketData[packets.Disconnect].Get(packets.TDisconnect).RawBytes)
++	}()
++
++	recv := make(chan []byte, 1)
++	go func() {
++		buf, err := io.ReadAll(w)
++		require.NoError(t, err)
++		recv <- buf
++	}()
++
++	require.NoError(t, <-o)
++	require.Equal(t, packets.TPacketData[packets.Connack].Get(packets.TConnackAcceptedNoSession).RawBytes, <-recv)
++
++	_ = w.Close()
++	_ = r.Close()
++}
+diff --git a/mqtt/rest/rest.go b/mqtt/rest/rest.go
+index 5cc2efc..39f697e 100644
+--- a/mqtt/rest/rest.go
++++ b/mqtt/rest/rest.go
+@@ -6,10 +6,12 @@ package rest
+ 
+ import (
+ 	"encoding/json"
++	"io"
+ 	"net/http"
+ 	"slices"
+ 	"strconv"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/prometheus/client_golang/prometheus/promhttp"
+ 	"github.com/wind-c/comqtt/v2/mqtt"
+@@ -29,6 +31,9 @@ const (
+ 	MqttGetBlacklistPath     = "/api/v1/mqtt/blacklist"
+ 	MqttAddBlacklistPath     = "/api/v1/mqtt/blacklist/{id}"
+ 	MqttDelBlacklistPath     = "/api/v1/mqtt/blacklist/{id}"
++	MqttGetBansPath          = "/api/v1/mqtt/bans"
++	MqttAddBanPath           = "/api/v1/mqtt/bans/{id}"
++	MqttDelBanPath           = "/api/v1/mqtt/bans/{id}"
+ 	MqttPublishMessagePath   = "/api/v1/mqtt/message"
+ 	MqttGetConfigPath        = "/api/v1/mqtt/config"
+ 	PrometheusMetrics        = "/metrics"
+@@ -66,6 +71,9 @@ func (s *Rest) GenHandlers() map[string]Handler {
+ 		"GET " + MqttGetBlacklistPath:      s.blacklist,
+ 		"POST " + MqttAddBlacklistPath:     s.kickClient,
+ 		"DELETE " + MqttDelBlacklistPath:   s.blanchClient,
++		"GET " + MqttGetBansPath:           s.getBans,
++		"POST " + MqttAddBanPath:           s.addBan,
++		"DELETE " + MqttDelBanPath:         s.delBan,
+ 		"POST " + MqttPublishMessagePath:   s.publishMessage,
+ 		"GET " + PrometheusMetrics: promhttp.HandlerFor(
+ 			s.server.Options.PrometheusRegistry,
+@@ -231,6 +239,67 @@ func (s *Rest) blacklist(w http.ResponseWriter, r *http.Request) {
+ 	}
+ }
+ 
++// banRequest is the optional body of POST /bans/{id}. An empty body or
++// ttl_seconds == 0 creates a permanent ban; positive ttl_seconds creates a
++// temporary one that expires automatically.
++type banRequest struct {
++	TTLSeconds int64  `json:"ttl_seconds"`
++	Reason     string `json:"reason"`
++}
++
++// getBans lists active ban policies (temporary and permanent) with the
++// remaining time of each temporary ban.
++// GET /api/v1/mqtt/bans
++func (s *Rest) getBans(w http.ResponseWriter, r *http.Request) {
++	Ok(w, s.server.BanList())
++}
++
++// addBan bans a client id for ttl_seconds (0 = permanent), immediately
++// disconnecting the client if it is connected to this node.
++// POST /api/v1/mqtt/bans/{id}
++func (s *Rest) addBan(w http.ResponseWriter, r *http.Request) {
++	cid := r.PathValue("id")
++	if cid == "" {
++		Error(w, http.StatusBadRequest, "client id is required")
++		return
++	}
++
++	var req banRequest
++	if r.Body != nil {
++		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
++			Error(w, http.StatusBadRequest, err.Error())
++			return
++		}
++	}
++	if req.TTLSeconds < 0 {
++		Error(w, http.StatusBadRequest, "ttl_seconds must be greater than or equal to 0")
++		return
++	}
++
++	policy := s.server.BanClient(cid, req.Reason, time.Duration(req.TTLSeconds)*time.Second)
++	disconnected := false
++	if cl, ol := s.server.Clients.Get(cid); ol {
++		s.server.DisconnectClient(cl, packets.ErrNotAuthorized)
++		disconnected = true
++	}
++	Ok(w, map[string]any{"ban": policy, "disconnected": disconnected})
++}
++
++// delBan removes the ban policy for a client id.
++// DELETE /api/v1/mqtt/bans/{id}
++func (s *Rest) delBan(w http.ResponseWriter, r *http.Request) {
++	cid := r.PathValue("id")
++	if cid == "" {
++		Error(w, http.StatusBadRequest, "client id is required")
++		return
++	}
++	if ok := s.server.UnbanClient(cid); !ok {
++		Error(w, http.StatusNotFound, "ban not found")
++		return
++	}
++	Ok(w, map[string]string{"id": cid})
++}
++
+ func parsePagedRequest(r *http.Request) PagedRequest {
+ 	req := PagedRequest{Page: 1, PageSize: defaultPageSize}
+ 	req.Search = r.URL.Query().Get("search")
+diff --git a/mqtt/rest/rest_test.go b/mqtt/rest/rest_test.go
+index d72350d..d87e7e6 100644
+--- a/mqtt/rest/rest_test.go
++++ b/mqtt/rest/rest_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"encoding/json"
+ 	"net/http"
+ 	"net/http/httptest"
++	"strings"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -251,3 +252,93 @@ func TestDeleteRetainedNotFound(t *testing.T) {
+ 	r.deleteRetained(w, req)
+ 	require.Equal(t, http.StatusOK, w.Code)
+ }
++
++func TestBanLifecycle(t *testing.T) {
++	r, server := newRestServer(t)
++
++	// list empty
++	req := httptest.NewRequest(http.MethodGet, MqttGetBansPath, nil)
++	w := httptest.NewRecorder()
++	r.getBans(w, req)
++	require.Equal(t, http.StatusOK, w.Code)
++	var empty []mqtt.BanPolicy
++	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &empty))
++	require.Empty(t, empty)
++
++	// temporary ban via POST with body
++	req = httptest.NewRequest(http.MethodPost, MqttAddBanPath, strings.NewReader(`{"ttl_seconds":120,"reason":"abuse"}`))
++	req.SetPathValue("id", "client-bad")
++	w = httptest.NewRecorder()
++	r.addBan(w, req)
++	require.Equal(t, http.StatusOK, w.Code)
++	var resp struct {
++		Ban          mqtt.BanPolicy `json:"ban"`
++		Disconnected bool           `json:"disconnected"`
++	}
++	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
++	require.Equal(t, "client-bad", resp.Ban.ClientID)
++	require.False(t, resp.Ban.Permanent)
++	require.Equal(t, int64(120), resp.Ban.Remaining)
++	require.Equal(t, "abuse", resp.Ban.Reason)
++	require.False(t, resp.Disconnected)
++	require.True(t, server.IsBanned("client-bad"))
++
++	// list now contains the policy
++	req = httptest.NewRequest(http.MethodGet, MqttGetBansPath, nil)
++	w = httptest.NewRecorder()
++	r.getBans(w, req)
++	var list []mqtt.BanPolicy
++	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &list))
++	require.Len(t, list, 1)
++	require.Equal(t, "client-bad", list[0].ClientID)
++
++	// remove
++	req = httptest.NewRequest(http.MethodDelete, MqttDelBanPath, nil)
++	req.SetPathValue("id", "client-bad")
++	w = httptest.NewRecorder()
++	r.delBan(w, req)
++	require.Equal(t, http.StatusOK, w.Code)
++	require.False(t, server.IsBanned("client-bad"))
++
++	// second removal reports 404
++	req = httptest.NewRequest(http.MethodDelete, MqttDelBanPath, nil)
++	req.SetPathValue("id", "client-bad")
++	w = httptest.NewRecorder()
++	r.delBan(w, req)
++	require.Equal(t, http.StatusNotFound, w.Code)
++}
++
++func TestAddBanPermanentEmptyBody(t *testing.T) {
++	r, server := newRestServer(t)
++
++	req := httptest.NewRequest(http.MethodPost, MqttAddBanPath, nil)
++	req.SetPathValue("id", "client-perm")
++	w := httptest.NewRecorder()
++	r.addBan(w, req)
++	require.Equal(t, http.StatusOK, w.Code)
++
++	policies := server.BanList()
++	require.Len(t, policies, 1)
++	require.True(t, policies[0].Permanent)
++	require.Equal(t, int64(-1), policies[0].Remaining)
++}
++
++func TestAddBanNegativeTTLRejected(t *testing.T) {
++	r, _ := newRestServer(t)
++
++	req := httptest.NewRequest(http.MethodPost, MqttAddBanPath, strings.NewReader(`{"ttl_seconds":-5}`))
++	req.SetPathValue("id", "client-x")
++	w := httptest.NewRecorder()
++	r.addBan(w, req)
++	require.Equal(t, http.StatusBadRequest, w.Code)
++}
++
++func TestDelBanNotFound(t *testing.T) {
++	r, _ := newRestServer(t)
++
++	req := httptest.NewRequest(http.MethodDelete, MqttDelBanPath, nil)
++	req.SetPathValue("id", "ghost")
++	w := httptest.NewRecorder()
++	r.delBan(w, req)
++	require.Equal(t, http.StatusNotFound, w.Code)
++}
+diff --git a/mqtt/server.go b/mqtt/server.go
+index 7327325..4be4d60 100644
+--- a/mqtt/server.go
++++ b/mqtt/server.go
+@@ -135,6 +135,7 @@ type Server struct {
+ 	inlineClient *Client              // inlineClient is a special client used for inline subscriptions and inline Publish
+ 	Blacklist    []string             // blacklist of client id
+ 	blacklistMu  sync.RWMutex
++	bans         *banBook // cluster-replicated or local temporary/permanent bans
+ }
+ 
+ // loop contains interval tickers for the system events loop.
+@@ -169,6 +170,7 @@ func New(opts *Options) *Server {
+ 		Clients:   NewClients(),
+ 		Topics:    NewTopicsIndex(),
+ 		Listeners: listeners.New(),
++		bans:      newBanBook(),
+ 		loop: &loop{
+ 			sysTopics:      time.NewTicker(time.Second * time.Duration(opts.SysTopicResendInterval)),
+ 			clientExpiry:   time.NewTicker(time.Second),
+@@ -334,6 +336,7 @@ func (s *Server) eventLoop() {
+ 			s.publishSysTopics()
+ 		case <-s.loop.clientExpiry.C:
+ 			s.clearExpiredClients(time.Now().Unix())
++			s.sweepBans(time.Now().UnixNano())
+ 		case <-s.loop.retainedExpiry.C:
+ 			s.clearExpiredRetainedMessages(time.Now().Unix())
+ 		case <-s.loop.willDelaySend.C:
+@@ -375,6 +378,10 @@ func (s *Server) attachClient(cl *Client, listener string) error {
+ 	if blocked {
+ 		return fmt.Errorf("blacklisted client: %s", cl.ID)
+ 	}
++	// cluster-replicated or local temporary ban (lazy expiry on read)
++	if s.bans.banned(cl.ID, time.Now().UnixNano()) {
++		return fmt.Errorf("banned client: %s", cl.ID)
++	}
+ 
+ 	code := s.validateConnect(cl, pk) // [MQTT-3.1.4-1] [MQTT-3.1.4-2]
+ 	if code != packets.CodeSuccess {

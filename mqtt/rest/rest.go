@@ -6,10 +6,12 @@ package rest
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/wind-c/comqtt/v2/mqtt"
@@ -29,6 +31,9 @@ const (
 	MqttGetBlacklistPath     = "/api/v1/mqtt/blacklist"
 	MqttAddBlacklistPath     = "/api/v1/mqtt/blacklist/{id}"
 	MqttDelBlacklistPath     = "/api/v1/mqtt/blacklist/{id}"
+	MqttGetBansPath          = "/api/v1/mqtt/bans"
+	MqttAddBanPath           = "/api/v1/mqtt/bans/{id}"
+	MqttDelBanPath           = "/api/v1/mqtt/bans/{id}"
 	MqttPublishMessagePath   = "/api/v1/mqtt/message"
 	MqttGetConfigPath        = "/api/v1/mqtt/config"
 	PrometheusMetrics        = "/metrics"
@@ -66,6 +71,9 @@ func (s *Rest) GenHandlers() map[string]Handler {
 		"GET " + MqttGetBlacklistPath:      s.blacklist,
 		"POST " + MqttAddBlacklistPath:     s.kickClient,
 		"DELETE " + MqttDelBlacklistPath:   s.blanchClient,
+		"GET " + MqttGetBansPath:           s.getBans,
+		"POST " + MqttAddBanPath:           s.addBan,
+		"DELETE " + MqttDelBanPath:         s.delBan,
 		"POST " + MqttPublishMessagePath:   s.publishMessage,
 		"GET " + PrometheusMetrics: promhttp.HandlerFor(
 			s.server.Options.PrometheusRegistry,
@@ -229,6 +237,67 @@ func (s *Rest) blacklist(w http.ResponseWriter, r *http.Request) {
 	} else {
 		Ok(w, s.server.Blacklist)
 	}
+}
+
+// banRequest is the optional body of POST /bans/{id}. An empty body or
+// ttl_seconds == 0 creates a permanent ban; positive ttl_seconds creates a
+// temporary one that expires automatically.
+type banRequest struct {
+	TTLSeconds int64  `json:"ttl_seconds"`
+	Reason     string `json:"reason"`
+}
+
+// getBans lists active ban policies (temporary and permanent) with the
+// remaining time of each temporary ban.
+// GET /api/v1/mqtt/bans
+func (s *Rest) getBans(w http.ResponseWriter, r *http.Request) {
+	Ok(w, s.server.BanList())
+}
+
+// addBan bans a client id for ttl_seconds (0 = permanent), immediately
+// disconnecting the client if it is connected to this node.
+// POST /api/v1/mqtt/bans/{id}
+func (s *Rest) addBan(w http.ResponseWriter, r *http.Request) {
+	cid := r.PathValue("id")
+	if cid == "" {
+		Error(w, http.StatusBadRequest, "client id is required")
+		return
+	}
+
+	var req banRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.TTLSeconds < 0 {
+		Error(w, http.StatusBadRequest, "ttl_seconds must be greater than or equal to 0")
+		return
+	}
+
+	policy := s.server.BanClient(cid, req.Reason, time.Duration(req.TTLSeconds)*time.Second)
+	disconnected := false
+	if cl, ol := s.server.Clients.Get(cid); ol {
+		s.server.DisconnectClient(cl, packets.ErrNotAuthorized)
+		disconnected = true
+	}
+	Ok(w, map[string]any{"ban": policy, "disconnected": disconnected})
+}
+
+// delBan removes the ban policy for a client id.
+// DELETE /api/v1/mqtt/bans/{id}
+func (s *Rest) delBan(w http.ResponseWriter, r *http.Request) {
+	cid := r.PathValue("id")
+	if cid == "" {
+		Error(w, http.StatusBadRequest, "client id is required")
+		return
+	}
+	if ok := s.server.UnbanClient(cid); !ok {
+		Error(w, http.StatusNotFound, "ban not found")
+		return
+	}
+	Ok(w, map[string]string{"id": cid})
 }
 
 func parsePagedRequest(r *http.Request) PagedRequest {

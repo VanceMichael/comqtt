@@ -1,0 +1,98 @@
+{{define "bans"}}{{template "layout" .}}{{end}}
+{{define "title"}}Client Bans{{end}}
+{{define "content"}}
+<div id="bans-area">
+<div class="card" style="margin-bottom:16px">
+  <div class="card-label">Temporary / permanent client ban</div>
+  <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
+    <div style="flex:2;min-width:180px"><label style="font-size:0.75rem;color:var(--text-muted)">Client ID</label><input id="ban-cid" type="text" placeholder="client id to ban"></div>
+    <div style="flex:1;min-width:140px"><label style="font-size:0.75rem;color:var(--text-muted)">Duration</label>
+      <select id="ban-ttl">
+        <option value="900">15 minutes</option>
+        <option value="3600" selected>1 hour</option>
+        <option value="21600">6 hours</option>
+        <option value="86400">24 hours</option>
+        <option value="604800">7 days</option>
+        <option value="0">Permanent</option>
+      </select>
+    </div>
+    <div style="flex:2;min-width:180px"><label style="font-size:0.75rem;color:var(--text-muted)">Reason (optional)</label><input id="ban-reason" type="text" placeholder="e.g. abuse"></div>
+    <div><button class="btn btn-danger" onclick="submitBan()">Ban client</button></div>
+  </div>
+</div>
+<table><thead><tr>
+  <th>Client ID</th><th>Type</th><th>Reason</th><th>Created</th><th>Expires</th><th>Remaining</th><th></th>
+</tr></thead><tbody id="bans-tbody"></tbody></table>
+<div class="text-muted" id="bans-empty" style="padding:12px 0;display:none">No active ban policies.</div>
+</div>
+<script>
+(function(){
+var API = '{{if .IsCluster}}/api/v1/cluster/bans{{else}}/api/v1/mqtt/bans{{end}}';
+var bans = [];
+function fmtRemaining(p){
+  if(p.permanent || p.remaining_seconds < 0) return 'Permanent';
+  var s = p.remaining_seconds;
+  if(s <= 0) return 'expired';
+  var d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),sec=s%60, out=[];
+  if(d) out.push(d+'d'); if(h) out.push(h+'h'); if(m) out.push(m+'m');
+  if(!d&&!h) out.push(sec+'s');
+  return out.join(' ');
+}
+function render(){
+  var html = bans.map(function(p){
+    var typ = p.permanent
+      ? '<span class="tag" style="color:var(--danger)">Permanent</span>'
+      : '<span class="tag tag-accent">Temporary</span>';
+    return '<tr><td class="mono">'+esc(p.client_id)+'</td>'+
+      '<td>'+typ+'</td>'+
+      '<td>'+esc(p.reason||'-')+'</td>'+
+      '<td>'+fmtTime(p.created_at)+'</td>'+
+      '<td>'+(p.expires_at ? fmtTime(p.expires_at) : '-')+'</td>'+
+      '<td class="mono" data-cid="'+esc(p.client_id)+'">'+fmtRemaining(p)+'</td>'+
+      '<td><button class="btn btn-danger" onclick="unban(\''+esc(encodeURIComponent(p.client_id))+'\')">Unban</button></td></tr>';
+  }).join('');
+  document.getElementById('bans-tbody').innerHTML = html;
+  document.getElementById('bans-empty').style.display = bans.length ? 'none' : 'block';
+}
+function load(){
+  api(API).then(function(data){
+    bans = data || [];
+    render();
+  }).catch(function(){ /* keep previous list on transient errors */ });
+}
+window.submitBan=function(){
+  var cid = document.getElementById('ban-cid').value.trim();
+  if(!cid){ showToast('Client ID is required','error'); return; }
+  var body = {
+    ttl_seconds: parseInt(document.getElementById('ban-ttl').value||'0',10),
+    reason: document.getElementById('ban-reason').value.trim()
+  };
+  api(API+'/'+encodeURIComponent(cid), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+    .then(function(){
+      document.getElementById('ban-cid').value='';
+      document.getElementById('ban-reason').value='';
+      showToast('Ban applied for '+cid, 'success');
+      load();
+    })
+    .catch(function(err){ showToast('Ban failed: '+err.message,'error'); });
+};
+window.unban=function(cid){
+  api(API+'/'+cid, {method:'DELETE'}).then(function(){
+    showToast('Ban removed','success');
+    load();
+  }).catch(function(err){ showToast('Unban failed: '+err.message,'error'); });
+};
+load();
+setInterval(load, 10000);
+// local countdown tick without hitting the API
+setInterval(function(){
+  bans.forEach(function(p){
+    if(p.permanent || p.remaining_seconds < 0) return;
+    if(p.remaining_seconds > 0) p.remaining_seconds--;
+    var cell = document.querySelector('td[data-cid="'+CSS.escape(p.client_id)+'"]');
+    if(cell) cell.textContent = fmtRemaining(p);
+  });
+}, 1000);
+})();
+</script>
+{{end}}

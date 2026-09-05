@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -250,4 +251,94 @@ func TestDeleteRetainedNotFound(t *testing.T) {
 
 	r.deleteRetained(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestBanLifecycle(t *testing.T) {
+	r, server := newRestServer(t)
+
+	// list empty
+	req := httptest.NewRequest(http.MethodGet, MqttGetBansPath, nil)
+	w := httptest.NewRecorder()
+	r.getBans(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var empty []mqtt.BanPolicy
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &empty))
+	require.Empty(t, empty)
+
+	// temporary ban via POST with body
+	req = httptest.NewRequest(http.MethodPost, MqttAddBanPath, strings.NewReader(`{"ttl_seconds":120,"reason":"abuse"}`))
+	req.SetPathValue("id", "client-bad")
+	w = httptest.NewRecorder()
+	r.addBan(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp struct {
+		Ban          mqtt.BanPolicy `json:"ban"`
+		Disconnected bool           `json:"disconnected"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, "client-bad", resp.Ban.ClientID)
+	require.False(t, resp.Ban.Permanent)
+	require.Equal(t, int64(120), resp.Ban.Remaining)
+	require.Equal(t, "abuse", resp.Ban.Reason)
+	require.False(t, resp.Disconnected)
+	require.True(t, server.IsBanned("client-bad"))
+
+	// list now contains the policy
+	req = httptest.NewRequest(http.MethodGet, MqttGetBansPath, nil)
+	w = httptest.NewRecorder()
+	r.getBans(w, req)
+	var list []mqtt.BanPolicy
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &list))
+	require.Len(t, list, 1)
+	require.Equal(t, "client-bad", list[0].ClientID)
+
+	// remove
+	req = httptest.NewRequest(http.MethodDelete, MqttDelBanPath, nil)
+	req.SetPathValue("id", "client-bad")
+	w = httptest.NewRecorder()
+	r.delBan(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.False(t, server.IsBanned("client-bad"))
+
+	// second removal reports 404
+	req = httptest.NewRequest(http.MethodDelete, MqttDelBanPath, nil)
+	req.SetPathValue("id", "client-bad")
+	w = httptest.NewRecorder()
+	r.delBan(w, req)
+	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestAddBanPermanentEmptyBody(t *testing.T) {
+	r, server := newRestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, MqttAddBanPath, nil)
+	req.SetPathValue("id", "client-perm")
+	w := httptest.NewRecorder()
+	r.addBan(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	policies := server.BanList()
+	require.Len(t, policies, 1)
+	require.True(t, policies[0].Permanent)
+	require.Equal(t, int64(-1), policies[0].Remaining)
+}
+
+func TestAddBanNegativeTTLRejected(t *testing.T) {
+	r, _ := newRestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, MqttAddBanPath, strings.NewReader(`{"ttl_seconds":-5}`))
+	req.SetPathValue("id", "client-x")
+	w := httptest.NewRecorder()
+	r.addBan(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestDelBanNotFound(t *testing.T) {
+	r, _ := newRestServer(t)
+
+	req := httptest.NewRequest(http.MethodDelete, MqttDelBanPath, nil)
+	req.SetPathValue("id", "ghost")
+	w := httptest.NewRecorder()
+	r.delBan(w, req)
+	require.Equal(t, http.StatusNotFound, w.Code)
 }

@@ -135,6 +135,7 @@ type Server struct {
 	inlineClient *Client              // inlineClient is a special client used for inline subscriptions and inline Publish
 	Blacklist    []string             // blacklist of client id
 	blacklistMu  sync.RWMutex
+	bans         *banBook // cluster-replicated or local temporary/permanent bans
 }
 
 // loop contains interval tickers for the system events loop.
@@ -169,6 +170,7 @@ func New(opts *Options) *Server {
 		Clients:   NewClients(),
 		Topics:    NewTopicsIndex(),
 		Listeners: listeners.New(),
+		bans:      newBanBook(),
 		loop: &loop{
 			sysTopics:      time.NewTicker(time.Second * time.Duration(opts.SysTopicResendInterval)),
 			clientExpiry:   time.NewTicker(time.Second),
@@ -334,6 +336,7 @@ func (s *Server) eventLoop() {
 			s.publishSysTopics()
 		case <-s.loop.clientExpiry.C:
 			s.clearExpiredClients(time.Now().Unix())
+			s.sweepBans(time.Now().UnixNano())
 		case <-s.loop.retainedExpiry.C:
 			s.clearExpiredRetainedMessages(time.Now().Unix())
 		case <-s.loop.willDelaySend.C:
@@ -374,6 +377,10 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	s.BlacklistMutexRUnlock()
 	if blocked {
 		return fmt.Errorf("blacklisted client: %s", cl.ID)
+	}
+	// cluster-replicated or local temporary ban (lazy expiry on read)
+	if s.bans.banned(cl.ID, time.Now().UnixNano()) {
+		return fmt.Errorf("banned client: %s", cl.ID)
 	}
 
 	code := s.validateConnect(cl, pk) // [MQTT-3.1.4-1] [MQTT-3.1.4-2]

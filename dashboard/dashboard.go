@@ -112,6 +112,7 @@ func (d *Dashboard) Routes() http.Handler {
 	protected.HandleFunc("GET /dashboard/publish", d.servePage("publish"))
 	protected.HandleFunc("GET /dashboard/auth", d.servePage("auth"))
 	protected.HandleFunc("GET /dashboard/acl", d.servePage("acl"))
+	protected.HandleFunc("GET /dashboard/bans", d.servePage("bans"))
 	protected.HandleFunc("POST /dashboard/profile/password", d.HandleChangePassword)
 
 	mux.Handle("/dashboard/", d.AuthMiddleware(protected))

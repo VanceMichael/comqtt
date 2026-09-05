@@ -7,12 +7,14 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"math/rand"
 	"net"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/panjf2000/ants/v2"
 	"github.com/wind-c/comqtt/v2/cluster/discovery"
@@ -82,6 +84,8 @@ func (a *Agent) Start() (err error) {
 
 	// listen for raft apply notifications
 	go a.raftApplyListener()
+	// leader purges expired temporary ban generations through raft
+	go a.banSweeper()
 
 	if a.Config.RaftImpl == config.RaftImplEtcd {
 		if a.raftPeer, err = etcd.Setup(a.Config, a.raftNotifyCh); err != nil {
@@ -241,6 +245,17 @@ func (a *Agent) raftApplyListener() {
 	for {
 		select {
 		case msg := <-a.raftNotifyCh:
+			// ban notifications are consumed on every node, including the
+			// proposer: the local mirror must be updated and the banned
+			// client's live connection on this node must be torn down.
+			switch msg.Type {
+			case message.BanAdd:
+				a.applyBanAdd(msg)
+				continue
+			case message.BanDel:
+				a.applyBanDel(msg)
+				continue
+			}
 			if msg.NodeID == "" || msg.NodeID == a.GetLocalName() || len(msg.Payload) == 0 {
 				continue
 			}
@@ -255,6 +270,37 @@ func (a *Agent) raftApplyListener() {
 		case <-a.ctx.Done():
 			return
 		}
+	}
+}
+
+// applyBanAdd mirrors a raft-committed ban into the local server book and
+// immediately disconnects the client if it is connected to this node.
+func (a *Agent) applyBanAdd(msg *message.Message) {
+	var ban raft.Ban
+	if err := json.Unmarshal(msg.Payload, &ban); err != nil {
+		log.Error("apply ban unmarshal", "error", err)
+		return
+	}
+	a.mqttServer.ApplyBan(ban.ClientID, ban.Reason, ban.CreatedAt, ban.ExpiresAt)
+	if cl, ok := a.mqttServer.Clients.Get(ban.ClientID); ok {
+		if err := a.mqttServer.DisconnectClient(cl, packets.ErrNotAuthorized); err != nil {
+			log.Debug("disconnect banned client", "cid", ban.ClientID, "error", err)
+		}
+		log.Info("ban disconnect client", "cid", ban.ClientID)
+	}
+}
+
+// applyBanDel mirrors a raft-committed ban removal into the local server book.
+func (a *Agent) applyBanDel(msg *message.Message) {
+	var rm raft.BanRemoval
+	if err := json.Unmarshal(msg.Payload, &rm); err != nil {
+		log.Error("apply unban unmarshal", "error", err)
+		return
+	}
+	if rm.CreatedAt > 0 && rm.ExpiresAt > 0 {
+		a.mqttServer.RemoveBanGeneration(rm.ClientID, rm.CreatedAt, rm.ExpiresAt)
+	} else {
+		a.mqttServer.ApplyBanRemoval(rm.ClientID, rm.At)
 	}
 }
 
@@ -341,7 +387,7 @@ func (a *Agent) processRelayMsg(msg *message.Message) {
 		addr := string(msg.Payload)
 		err := a.raftPeer.Join(msg.NodeID, addr)
 		OnJoinLog(msg.NodeID, addr, "raft join", err)
-	case packets.Subscribe, packets.Unsubscribe:
+	case packets.Subscribe, packets.Unsubscribe, message.BanAdd, message.BanDel:
 		a.raftPropose(msg)
 	case packets.Publish:
 		pk := packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Publish}}
@@ -578,4 +624,140 @@ func (a *Agent) RemoveRaftPeer(id string) {
 func (a *Agent) GetValue(key string) []string {
 	log.Info("get value", "key", key)
 	return a.raftPeer.Lookup(key)
+}
+
+// banSweepInterval is how often the leader purges expired temporary bans
+// from the replicated ban book. Enforcement never depends on the sweep:
+// reads treat expired generations as inactive (lazy expiry).
+const banSweepInterval = 30 * time.Second
+
+// BanClient proposes a cluster-wide ban for clientID. A ttl <= 0 means a
+// permanent ban. The ban generation becomes durable through raft: it
+// survives node restarts, is replicated to nodes that were briefly offline
+// when they catch up, and every node disconnects the client's live
+// connection on apply. Proposing is idempotent: retries after timeouts
+// never produce a weaker result than the newest committed generation.
+func (a *Agent) BanClient(clientID, reason string, ttl time.Duration) (mqtt.BanPolicy, error) {
+	now := time.Now()
+	createdAt := now.UnixNano()
+	expiresAt := int64(raft.BanExpiresNever)
+	if ttl > 0 {
+		expiresAt = now.Add(ttl).UnixNano()
+	}
+
+	ban := raft.Ban{ClientID: clientID, Reason: reason, CreatedAt: createdAt, ExpiresAt: expiresAt}
+	payload, err := json.Marshal(ban)
+	if err != nil {
+		return mqtt.BanPolicy{}, err
+	}
+	msg := &message.Message{
+		Type:     message.BanAdd,
+		NodeID:   a.GetLocalName(),
+		ClientID: clientID,
+		Payload:  payload,
+	}
+
+	if a.raftPeer.IsApplyRight() {
+		err = a.raftPeer.Propose(msg)
+		OnApplyLog(a.GetLocalName(), msg.NodeID, msg.Type, []byte(msg.ClientID), "raft ban apply", err)
+	} else {
+		// follower: hand over to the leader (or broadcast when no leader is
+		// known); delivery is best-effort exactly like subscription proposes.
+		a.raftPropose(msg)
+	}
+	if err != nil {
+		return mqtt.BanPolicy{}, err
+	}
+
+	policy := mqtt.BanPolicy{
+		ClientID:  clientID,
+		Reason:    reason,
+		Permanent: expiresAt == raft.BanExpiresNever,
+		CreatedAt: createdAt / int64(time.Second),
+		ExpiresAt: expiresAt / int64(time.Second),
+		Remaining: banTTLSeconds(expiresAt, now.UnixNano()),
+	}
+	return policy, nil
+}
+
+// UnbanClient proposes removal of the ban generation for clientID. The
+// removal is fenced by the request time so that a delayed/stale unban never
+// deletes a newer ban generation.
+func (a *Agent) UnbanClient(clientID string) error {
+	rm := raft.BanRemoval{ClientID: clientID, At: time.Now().UnixNano()}
+	payload, err := json.Marshal(rm)
+	if err != nil {
+		return err
+	}
+	msg := &message.Message{
+		Type:     message.BanDel,
+		NodeID:   a.GetLocalName(),
+		ClientID: clientID,
+		Payload:  payload,
+	}
+	if a.raftPeer.IsApplyRight() {
+		err = a.raftPeer.Propose(msg)
+		OnApplyLog(a.GetLocalName(), msg.NodeID, msg.Type, []byte(msg.ClientID), "raft unban apply", err)
+	} else {
+		a.raftPropose(msg)
+	}
+	return err
+}
+
+// BanList returns the cluster-wide ban policies as mirrored on this node.
+// The mirror is the raft state applied so far, so after catch-up it is
+// identical on every node.
+func (a *Agent) BanList() []mqtt.BanPolicy {
+	return a.mqttServer.BanList()
+}
+
+// banSweeper periodically proposes removal of expired temporary ban
+// generations. Only the leader proposes, which keeps duplicate log entries
+// out; a leadership change simply moves the job. Cleanup entries identify
+// the exact generation they observed, so a re-ban racing the cleanup is
+// never deleted.
+func (a *Agent) banSweeper() {
+	ticker := time.NewTicker(banSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if a.raftPeer == nil || !a.raftPeer.IsApplyRight() {
+				continue
+			}
+			now := time.Now().UnixNano()
+			for _, ban := range a.raftPeer.ListBans() {
+				if ban.ExpiresAt == raft.BanExpiresNever || now < ban.ExpiresAt {
+					continue
+				}
+				payload, err := json.Marshal(raft.BanRemoval{
+					ClientID:  ban.ClientID,
+					CreatedAt: ban.CreatedAt,
+					ExpiresAt: ban.ExpiresAt,
+				})
+				if err != nil {
+					continue
+				}
+				a.raftPropose(&message.Message{
+					Type:     message.BanDel,
+					NodeID:   a.GetLocalName(),
+					ClientID: ban.ClientID,
+					Payload:  payload,
+				})
+				log.Info("raft ban expiry cleanup proposed", "cid", ban.ClientID)
+			}
+		case <-a.ctx.Done():
+			return
+		}
+	}
+}
+
+func banTTLSeconds(expiresAt, now int64) int64 {
+	if expiresAt == raft.BanExpiresNever {
+		return -1
+	}
+	if expiresAt <= now {
+		return 0
+	}
+	return (expiresAt - now) / int64(time.Second)
 }

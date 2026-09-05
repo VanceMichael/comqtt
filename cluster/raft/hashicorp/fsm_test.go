@@ -2,11 +2,14 @@ package hashicorp
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"testing"
 
+	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 	"github.com/wind-c/comqtt/v2/cluster/message"
+	base "github.com/wind-c/comqtt/v2/cluster/raft"
 	"github.com/wind-c/comqtt/v2/mqtt/packets"
 )
 
@@ -51,6 +54,41 @@ func TestFsmSnapshotRestoreRoundTrip(t *testing.T) {
 		require.Equal(t, packets.Subscribe, msg.Type)
 		require.NotEmpty(t, msg.Payload)
 	}
+}
+
+// Ban generations must be persisted in the snapshot and replayed when
+// restored, so that restarted/caught-up nodes converge to the same policies.
+func TestFsmSnapshotBansRoundTrip(t *testing.T) {
+	src := NewFsm(nil)
+	src.Add("topic/a", "node1")
+	payload, err := json.Marshal(base.Ban{ClientID: "bad-client", Reason: "abuse", CreatedAt: 1000, ExpiresAt: 2000})
+	require.NoError(t, err)
+	m := message.Message{Type: message.BanAdd, ClientID: "bad-client", Payload: payload}
+	src.Apply(&raft.Log{Data: m.MsgpackBytes()})
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	sink := new(testSnapshotSink)
+	require.NoError(t, snap.Persist(sink))
+
+	notifyCh := make(chan *message.Message, 16)
+	dst := NewFsm(notifyCh)
+	require.NoError(t, dst.Restore(io.NopCloser(bytes.NewReader(sink.Bytes()))))
+
+	b, ok := dst.bans.Get("bad-client")
+	require.True(t, ok)
+	require.Equal(t, "abuse", b.Reason)
+	require.Equal(t, int64(2000), b.ExpiresAt)
+
+	var banReplays int
+	for len(notifyCh) > 0 {
+		msg := <-notifyCh
+		if msg.Type == message.BanAdd {
+			banReplays++
+			require.Equal(t, "bad-client", msg.ClientID)
+		}
+	}
+	require.Equal(t, 1, banReplays)
 }
 
 // A corrupt snapshot must leave the existing state untouched.

@@ -7,6 +7,7 @@ package hashicorp
 import (
 	"bytes"
 	"encoding/gob"
+	"encoding/json"
 	"io"
 	"strings"
 
@@ -19,12 +20,14 @@ import (
 
 type Fsm struct {
 	*base.KV
+	bans     *base.BanBook
 	notifyCh chan<- *message.Message
 }
 
 func NewFsm(notifyCh chan<- *message.Message) *Fsm {
 	fsm := &Fsm{
 		KV:       base.NewKV(),
+		bans:     base.NewBanBook(),
 		notifyCh: notifyCh,
 	}
 	return fsm
@@ -37,14 +40,40 @@ func (f *Fsm) Apply(l *raft.Log) interface{} {
 	}
 	filter := string(msg.Payload)
 	deliverable := false
-	if msg.Type == packets.Subscribe {
+	switch {
+	case msg.Type == packets.Subscribe:
 		deliverable = f.Add(filter, msg.NodeID)
-	} else if msg.Type == packets.Unsubscribe {
+		log.Info("raft apply", "from", msg.NodeID, "filter", filter, "type", msg.Type)
+	case msg.Type == packets.Unsubscribe:
 		deliverable = f.Del(filter, msg.NodeID)
-	} else {
+		log.Info("raft apply", "from", msg.NodeID, "filter", filter, "type", msg.Type)
+	case msg.Type == message.BanAdd:
+		var ban base.Ban
+		if err := json.Unmarshal(msg.Payload, &ban); err != nil {
+			log.Error("raft apply ban unmarshal", "error", err)
+			return nil
+		}
+		f.bans.Put(ban)
+		log.Info("raft apply ban", "from", msg.NodeID, "cid", ban.ClientID, "expires", ban.ExpiresAt)
+		// ban notifications must reach every node (including the proposer)
+		// so the local mirror is updated and the live connection is torn down.
+		deliverable = true
+	case msg.Type == message.BanDel:
+		var rm base.BanRemoval
+		if err := json.Unmarshal(msg.Payload, &rm); err != nil {
+			log.Error("raft apply unban unmarshal", "error", err)
+			return nil
+		}
+		if rm.CreatedAt > 0 && rm.ExpiresAt > 0 {
+			f.bans.RemoveGeneration(rm.ClientID, rm.CreatedAt, rm.ExpiresAt)
+		} else {
+			f.bans.Remove(rm.ClientID, rm.At)
+		}
+		log.Info("raft apply unban", "from", msg.NodeID, "cid", rm.ClientID)
+		deliverable = true
+	default:
 		return nil
 	}
-	log.Info("raft apply", "from", msg.NodeID, "filter", filter, "type", msg.Type)
 	if f.notifyCh != nil && deliverable {
 		select {
 		case f.notifyCh <- &msg:
@@ -60,6 +89,12 @@ func (f *Fsm) Lookup(key string) []string {
 	return f.Get(key)
 }
 
+// ListBans returns all replicated ban generations, including expired ones
+// not yet purged. Callers treat expired entries as inactive.
+func (f *Fsm) ListBans() []base.Ban {
+	return f.bans.All()
+}
+
 func (f *Fsm) DelByNode(node string) int {
 	return f.DelByValue(node)
 }
@@ -69,7 +104,9 @@ func (f *Fsm) Snapshot() (raft.FSMSnapshot, error) {
 }
 
 func (f *Fsm) Restore(ir io.ReadCloser) error {
-	if err := f.KV.Restore(ir); err != nil {
+	// subscriptions map first, ban-policy map second (absent in old snapshots);
+	// a single decoder must read both because gob buffers its reads.
+	if err := f.KV.RestoreSnapshot(ir, f.bans); err != nil {
 		return err
 	}
 	f.notifyReplay()
@@ -86,17 +123,37 @@ func (f *Fsm) notifyReplay() {
 		f.notifyCh <- &msg
 		log.Info("raft replay", "from", msg.NodeID, "filter", filter, "type", msg.Type)
 	}
+	for _, ban := range f.bans.All() {
+		payload, err := json.Marshal(ban)
+		if err != nil {
+			continue
+		}
+		msg := message.Message{
+			Type:     message.BanAdd,
+			ClientID: ban.ClientID,
+			Payload:  payload,
+		}
+		f.notifyCh <- &msg
+		log.Info("raft replay ban", "cid", ban.ClientID, "expires", ban.ExpiresAt)
+	}
 }
 
 func (f *Fsm) Persist(sink raft.SnapshotSink) error {
 	var buffer bytes.Buffer
-	err := gob.NewEncoder(&buffer).Encode(f.GetAll())
-	if err != nil {
+	if err := gob.NewEncoder(&buffer).Encode(f.GetAll()); err != nil {
 		return err
 	}
-	sink.Write(buffer.Bytes())
-	sink.Close()
-	return nil
+	// bans are appended as a second gob object only when present, so that
+	// ban-free snapshots keep the exact historical format.
+	if bans := f.bans.Snapshot(); len(bans) > 0 {
+		if err := gob.NewEncoder(&buffer).Encode(bans); err != nil {
+			return err
+		}
+	}
+	if _, err := sink.Write(buffer.Bytes()); err != nil {
+		return err
+	}
+	return sink.Close()
 }
 
 func (f *Fsm) Release() {}

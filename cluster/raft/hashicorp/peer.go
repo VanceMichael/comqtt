@@ -16,6 +16,7 @@ import (
 
 	"github.com/wind-c/comqtt/v2/cluster/log"
 	"github.com/wind-c/comqtt/v2/cluster/message"
+	base "github.com/wind-c/comqtt/v2/cluster/raft"
 	"github.com/wind-c/comqtt/v2/cluster/utils"
 	"github.com/wind-c/comqtt/v2/config"
 
@@ -223,6 +224,11 @@ func (p *Peer) Propose(msg *message.Message) error {
 
 func (p *Peer) Lookup(key string) []string {
 	return p.fsm.Lookup(key)
+}
+
+// ListBans returns all ban generations replicated through raft.
+func (p *Peer) ListBans() []base.Ban {
+	return p.fsm.ListBans()
 }
 
 func (p *Peer) DelByNode(node string) int {

@@ -15,6 +15,10 @@ const (
 	Reserved byte = iota + 21
 	RaftJoin
 	RaftApply
+	// BanAdd replicates a client ban policy (temporary or permanent)
+	BanAdd
+	// BanDel replicates a client ban removal (explicit unban or expiry cleanup)
+	BanDel
 )
 
 //go:generate msgp -io=false
