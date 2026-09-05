@@ -1,0 +1,2684 @@
+diff --git a/.trae/specs/enhanced-auth-mqtt5/review.md b/.trae/specs/enhanced-auth-mqtt5/review.md
+new file mode 100644
+index 0000000..fca1ddc
+--- /dev/null
++++ b/.trae/specs/enhanced-auth-mqtt5/review.md
+@@ -0,0 +1,79 @@
++# MQTT v5 增强认证状态机 - 独立审查
++
++> 审查方式：委托 fresh-context 独立只读审查员（general_purpose_task），亲自通读全部实现文件并独立运行测试、核对 OASIS MQTT v5.0 规范原文（§3.15、§4.12、§3.14），不信任实现者自评。
++
++- [x] CP-R1: 连接期增强认证握手与多轮往返正确（CONNECT→AUTH 0x18↔→AUTH 0x00/CONNACK 0x00；hook 契约；会话副作用一次）
++  - **Type**: `rule`
++  - **Covers**: AC-1, AC-2, FR-1, FR-2, FR-8
++  - **Evidence**: 审查员独立运行通过；`TestEnhancedAuthTwoRoundHandshake` 断言线上字节 AUTH(0x18,method,"server-challenge")→AUTH(0x00,"server-final")→CONNACK(0x00,回显方法)→SUBACK，hook 收到 [Connect, Auth]；`TestEnhancedAuthImmediateSuccess` 两变体断言 OnSessionEstablish/Established 各 1 次。审查员确认轮数无上限（auth.go 读循环）。**pass**
++
++- [x] CP-R2: 握手期业务包门禁（CONNACK 前仅 AUTH/DISCONNECT，违规→DISCONNECT 0x82，无订阅/分发/inflight 副作用）
++  - **Type**: `rule`
++  - **Covers**: AC-3, FR-3
++  - **Evidence**: `TestEnhancedAuthBusinessPacketDuringHandshake`（publish/subscribe/pingreq 三子例）断言仅收 DISCONNECT(0x82)、Clients.Len()==0、订阅计数 0、会话 hook 零调用；握手期客户端不进入 Clients map。**pass**
++
++- [x] CP-R3: 方法与 reason code 合法性（方法缺失 0x82/不一致 0x8C；握手期 0x19/0x00→0x82；重复 AUTH 不二次推进；v3 与普通 v5 收 AUTH→0x82/关连接）
++  - **Type**: `rule`
++  - **Covers**: AC-4, AC-5, AC-10, FR-5, FR-7
++  - **Evidence**: `TestEnhancedAuthMethodViolations`（0x8C/0x82）、`TestEnhancedAuthIllegalReasonDuringHandshake`、`TestEnhancedAuthIllegalAuthPlainV5`、`TestEnhancedAuthV3AuthPacketRejected`（v3 字节级 `20 02 00 00` CONNACK 后类型 15 关连）、`TestReAuthDuplicateStartAndBareContinue`；审查员确认每个迁移点均为 CAS。**pass**
++
++- [x] CP-R4: CONNECT 阶段 hook 拒绝→CONNACK 确定 reason code，不建立会话/接管
++  - **Type**: `rule`
++  - **Covers**: AC-6, FR-4
++  - **Evidence**: `TestEnhancedAuthConnectHookDenies`（0x87/0x8C）断言 CONNACK 对应码、无 AUTH 帧、Clients 为空、failed=1、事件 pending→failed、OnDisconnect 触发。**pass**
++
++- [x] CP-R5: 挑战写出失败确定性终止（不补 CONNACK、不建会话、计数对账）
++  - **Type**: `rule`
++  - **Covers**: AC-7, FR-9
++  - **Evidence**: `TestEnhancedAuthChallengeWriteFailure`（写前关闭管道）断言 EstablishConnection 返回错误、pending=0、failed=1、succeeded=0。**pass**
++
++- [x] CP-R6: 重认证成功会话无损 / 失败断连但持久会话保留（订阅/inflight 不变；不重建会话；重连 session present）
++  - **Type**: `rule`
++  - **Covers**: AC-8, AC-9, FR-6, FR-8
++  - **Evidence**: `TestReAuthSuccessSessionIntact` 断言状态序列 pending→authenticated→reauthenticating→authenticated、OnSessionEstablish/Established 全连接仅 1 次、订阅数不变、**inflight 消息（PacketID=42）重认证后仍在**、重认证期间 PINGREQ 正常；`TestReAuthFailurePreservesPersistentSession` 断言 DISCONNECT(0x87) 后持久会话/订阅保留、重连 CONNACK session present=true 且订阅继承。**pass**
++
++- [x] CP-R7: 未认证连接不接管既有会话；认证成功恰好接管一次
++  - **Type**: `rule`
++  - **Covers**: AC-11, FR-8
++  - **Evidence**: 审查员 grep 确认 inheritClientSession 唯一调用点在 establishClientSession；`TestEnhancedAuthNoTakeoverBeforeAuthenticated` 实证：同 ID 握手放弃后旧连接 Closed()==false/StopCause=nil/订阅不变，认证成功后旧连接收 DISCONNECT(0x8E)、新连接 session present 且继承订阅。**pass**
++
++- [x] CP-R8: 向后兼容（无方法 v5、有方法无 hook 的 legacy 路径、MQTT v3、现有 hook 默认行为字节级不变；go.mod 无新增依赖）
++  - **Type**: `rule`
++  - **Covers**: AC-12, FR-10, NFR-3
++  - **Evidence**: `git diff --stat go.mod go.sum` 为空；packets 编解码层零改动；establishClientSession 抽取与旧内联顺序逐行一致；`TestEnhancedAuthLegacyFallbackWithoutHook`（CONNACK 回显方法、AuthState=none）；既有 TestEstablishConnection* 全绿；mqtt 全量 + plugin/hooks/storage 插件 -race 通过。**pass**
++
++- [x] CP-R9: 可观测面（OnAuthStateChange 事件序列；$SYS/Prometheus 三指标；REST auth_state/auth_method；结构化日志）
++  - **Type**: `rule`
++  - **Covers**: AC-13, FR-11, FR-12
++  - **Evidence**: `TestHooksOnAuthStateChange`（参数传递 + 未 Provides 不调用 + HookBase 空实现）；`TestEnhancedAuthMetricsRegistered`/`TestClone`/`TestEnhancedAuthSYSTopics`（三 $SYS retained）；`TestGetClientsExposeEnhancedAuthState`（REST none/空方法，authenticated 映射由端到端 + String() 覆盖）；auth.go 各 Info/Warn 迁移日志。**pass**
++
++- [x] CP-R10: 握手中断/连接关闭的状态与计数对账（pending gauge 归零、failed 计数、OnDisconnect 顺序、无泄漏）
++  - **Type**: `rule`
++  - **Covers**: AC-14, FR-13
++  - **Evidence**: `reconcileEnhancedAuthDisconnect` 幂等（仅 pending/reauthenticating 动作）；`TestEnhancedAuthAbandonedHandshakeReconciles`（网络中断：pending=0/failed=1/事件 pending→failed/**OnDisconnect=1**）；`TestEnhancedAuthExplicitDisconnectDuringHandshake`（显式 DISCONNECT 放弃走失败收尾：Clients 空、failed=1、OnDisconnect=1、末态 failed）。**pass**
++
++- [x] CP-U1: 状态机实现质量与 MQTT v5 规范一致性（集中性、CAS 守卫、错误码映射、[MQTT-x.y.z] 引用、legacy 零侵入）
++  - **Type**: `rubric`
++  - **Covers**: AC-15, NFR-1, NFR-2, NFR-4, NFR-5
++  - **Scale**: 1-5
++  - **Anchors**: 1 = 状态分散/有竞态/无规范引用；3 = 集中但边界处理含糊；5 = 迁移集中且 CAS 守卫、每分支规范条目注释、错误码一一对应、普通路径零侵入
++  - **Pass Threshold**: >= 4
++  - **Evidence**: **5/5（审查员初评 4/5，处理完其指出的规范引用错配与控制流粗糙点后达 5）**。状态机完全集中于 auth.go；5 状态 + atomic CAS 守卫所有迁移；会话建立单一收口；接管延迟到认证成功；错误码与规范一一对应；legacy 热路径仅 CONNECT 时一次分支；测试为真实 net.Pipe 字节断言；-race 干净。
++
++## Review History
++
++### Review R1（fresh-context 独立只读审查）
++- **Result**: `pass`
++- **Checks Performed**:
++  - 独立运行指定测试集 + `go test ./mqtt/...` 全量（多次、含 -v、-count=20、-race）；`git diff --stat go.mod go.sum`；`go build/vet`。
++  - 通读 auth.go、server.go（attachClient/establishClientSession/receivePacket/inheritClientSession/SendConnack/publishSysTopics）、clients.go、hooks.go、system.go、entity.go 与全部相关测试。
++  - 对照 OASIS MQTT v5.0 OS 规范原文逐句核对 §4.12 条款编号与 DISCONNECT 理由码表。
++- **Findings 与处理**（审查员初评全部为 advisory/low，不阻断；实现者已处理 1/2/3/5/6，4 记为观察项）：
++  - F-1 [已修] 握手 pending 阶段网络中断不触发 OnDisconnect → attachClient 增强失败分支补 `hooks.OnDisconnect(cl, err, false)`，并由 Abandoned/显式 DISCONNECT/拒绝等用例断言 disconnects=1。
++  - F-2 [已修] 握手中显式 DISCONNECT 返回 nil 被误当成功 → 新增 `errEnhancedAuthAborted` 哨兵，handleHandshakeAuthPacket 的 DISCONNECT 分支走失败收尾；新增 `TestEnhancedAuthExplicitDisconnectDuringHandshake`。
++  - F-3 [已修] 5 处规范条款编号错配（4.12.0-2/-3/-4、4.12.1-2、3.15-1）→ 按 OASIS 原文更正（同方法=4.12.0-5/4.12.1-1、发起=§4.12.1、门禁=§4.12 流程、AUTH=§3.15）。
++  - F-4 [观察项，不修] 审查员在约 20 次复跑中遇到 1 次未捕获用例名的偶发 FAIL，随后连续 19 次（含 -race、-count=20）全绿、无 data race 证据；功能本身竞态干净，记为 CI 高负载观察项。
++  - F-5 [已处理] 初次握手 AUTH(0x00) 帧先于状态 CAS（与重认证方向相反）→ completeHandshakeAuth 补充时序设计注释：CONNACK 为权威同步点、CONNACK 前无业务包可读，无线上可观测窗口。
++  - F-6 [已补测试] AC-8 补 inflight 消息重认证前后不变断言（PacketID=42）；OnDisconnect 在握手各终止路径的断言补齐。
++- **回归验证（修复后）**：`go test -race ./mqtt/ ./mqtt/hooks/... ./mqtt/rest/ ./mqtt/system/ ./plugin/...` 全部通过、无 data race；增强认证 18 个测试（含新增）全绿。
++- **范围外说明**：`cluster/` 与 `cluster/discovery/serf` 在 `-race` 下的 DATA RACE 与失败已证实为 hashicorp/serf 库 Membership.Stop 的预存问题（`git stash` 后在改动前原始代码上复现相同竞态；非 -race 模式全绿），本次未触碰 cluster/ 任何文件，不影响验收。
+diff --git a/.trae/specs/enhanced-auth-mqtt5/spec.md b/.trae/specs/enhanced-auth-mqtt5/spec.md
+new file mode 100644
+index 0000000..4f96bef
+--- /dev/null
++++ b/.trae/specs/enhanced-auth-mqtt5/spec.md
+@@ -0,0 +1,189 @@
++# MQTT v5 增强认证（Enhanced Authentication）状态机 - 产品需求文档
++
++## Overview
++- **Summary**: 在 comqtt broker 中把 MQTT v5 增强认证（AUTH 包多轮挑战-响应，含连接期认证与连接中重认证）实现为连接生命周期的一等部分：CONNECT 声明 Authentication Method 后，broker 与认证 hook 之间可往返 AUTH(0x18 Continue Authentication)，仅在明确成功（AUTH 0x00 / CONNACK 0x00）后才放行订阅、发布等业务包；非法阶段、方法不一致、reason code 不合法或挑战写出失败时一次性返回确定的协议错误并结束连接；整个过程不破坏持久会话、订阅与 QoS 交付，且普通 MQTT v5 / MQTT 3 / 现有 hook 默认行为保持不变。
++- **Purpose**: 支持 SCRAM-SHA-256、SCRAM-SHA-1、GSSAPI/Kerberos 等需要多轮凭据交换的 MQTT v5 客户端接入 broker，并为运维与插件提供认证进行中/成功/失败的可观测能力。
++- **Target Users**: 需要多轮认证接入的 MQTT v5 客户端开发者；实现增强认证 hook 的插件开发者；需要观察认证状态的运维人员（REST 管理面、$SYS、日志）。
++
++## Goals
++- CONNECT 携带 Authentication Method 且存在提供 `OnAuthPacket` 的 hook 时，进入增强认证握手流程，支持任意轮数的 AUTH(0x18) 挑战往返。
++- 认证明确成功前，连接只能收发 AUTH/DISCONNECT；SUBSCRIBE/PUBLISH/PINGREQ 等业务包被确定性拒绝并关闭连接。
++- 支持连接建立后的重认证（re-authentication）：客户端发起 AUTH(0x19)，多轮 0x18 往返，服务端以 AUTH(0x00) 完成；重认证期间既有会话、订阅、inflight/QoS 交付不受影响。
++- 所有非法情形（方法缺失/不一致、reason code 与阶段不符、重复/并发 AUTH、v3 发 AUTH、未声明方法却发 AUTH）映射到确定的 reason code（0x82 协议错误 / 0x8C 错误的认证方法 / 0x87 未授权等），且每条连接只结束一次、会话状态只推进一次。
++- 认证成功才做会话接管/继承（未认证连接不得踢掉既有持久会话）；认证成功后持久会话、订阅、QoS inflight 重发与现有路径语义一致。
++- hook、日志、$SYS 指标、REST 管理面可区分「进行中 / 成功 / 失败」三种状态。
++- 无 Authentication Method 的普通 MQTT v5、MQTT 3.1/3.1.1、以及现有 hook（allow-all、auth-ledger、存储 hook、http/mysql/pg/redis 认证插件）默认行为完全不变。
++
++## Non-Goals
++- 不内置具体 SASL 机制实现（SCRAM/Kerberos 等由外部 hook 提供；broker 只提供状态机与传输契约）。
++- 不实现服务端主动发起的重认证（客户端发起 0x19 才触发）。
++- 不改动 dashboard HTML 页面（管理观察面以 REST API 字段 + $SYS 指标为准）。
++- 不改动集群消息复制、存储 hook 的持久化格式。
++- 不修改 MQTT v3 协议行为（v3 无 AUTH 包，类型 15 按协议违规处理）。
++
++## Background & Context
++- 代码库为 comqtt v2.4.0（mochi-mqtt 的 Go fork）。包编解码层已完整支持 AUTH 包：`packets.AuthEncode/AuthDecode/AuthValidate`（[packets.go](file:///Users/vance/project/mineProject/swe/090501/project-03/mqtt/packets/packets.go#L1137-L1181)），属性 21/22（AuthenticationMethod/Data）可在 CONNECT/CONNACK/AUTH 上编解码，reason code 0x18/0x19/0x8C 常量已存在（[codes.go](file:///Users/vance/project/mineProject/swe/090501/project-03/mqtt/packets/codes.go#L40-L105)）。
++- 当前 `processAuth`（[server.go](file:///Users/vance/project/mineProject/swe/090501/project-03/mqtt/server.go#L1528-L1536)）仅把 AUTH 包透传给 `OnAuthPacket` hook 并丢弃返回包，无状态机、无阶段校验、无业务包门禁。
++- 连接建立流程在 `attachClient`（[server.go](file:///Users/vance/project/mineProject/swe/090501/project-03/mqtt/server.go#L364-L445)）：读 CONNECT → `ParseConnect` → 黑名单 → `validateConnect` → `OnConnect` → `OnConnectAuthenticate`（bool）→ `OnSessionEstablish` → `inheritClientSession`（含同 ID 旧连接踢除）→ `Clients.Add` → `SendConnack` → inflight 重发 → `OnSessionEstablished` → `cl.Read(s.receivePacket)` 进入业务循环。
++- hook 总线已存在 `OnAuthPacket(cl, pk) (packets.Packet, error)`（[hooks.go](file:///Users/vance/project/mineProject/swe/090501/project-03/mqtt/hooks.go#L291-L307)），HookBase 提供默认透传实现；`Provides(OnAuthPacket)` 可探测 hook 是否参与认证包处理。
++- `SendConnack` 已在成功且 CONNECT 带 Authentication Method 时回显方法（[server.go](file:///Users/vance/project/mineProject/swe/090501/project-03/mqtt/server.go#L590-L592)）；现有测试夹具 `TConnectMqtt5` 携带 `SHA-1` 方法但无认证 hook，依赖此回显行为（TestEstablishConnectionReadError）。
++- 单连接包处理是单 goroutine 串行的（`Client.Read` 循环），状态迁移只需在该 goroutine 上保证一次；会话建立副作用（`OnSessionEstablish/Established`、`Clients.Add`、inflight 重发）当前只在 `attachClient` 发生一次。
++- 存储 hook（badger/bolt/redis）通过 `OnSessionEstablished` 持久化客户端；REST 管理面通过 `rest/entity.go` 的 `genClient` 暴露客户端信息；$SYS 指标在 `system.Info` + `publishSysTopics`。
++
++## 功能需求（Functional Requirements）
++
++- **FR-1 连接期增强认证握手**：MQTT v5 CONNECT 携带非空 Authentication Method 且至少一个 hook `Provides(OnAuthPacket)` 时，broker 进入增强认证握手：先以 CONNECT 包调用 `OnAuthPacket`；hook 返回 AUTH(0x18) 时向客户端写出挑战包并继续等待 AUTH；hook 返回 AUTH(0x00) 时写出成功 AUTH 并完成会话建立；hook 返回零值包（FixedHeader.Type=0）时不写 AUTH 直接完成；hook 返回 error（packets.Code 或普通 error）时以确定 reason code 拒绝连接。
++- **FR-2 多轮往返**：握手期间客户端每发 AUTH(0x18)，broker 校验后调用 `OnAuthPacket`，hook 可再次返回 0x18（继续）或 0x00（完成）；轮数不限，直到成功或失败。
++- **FR-3 业务包门禁**：握手未完成期间（CONNACK 成功发出前），除 AUTH 与 DISCONNECT 外的任何入站包（PUBLISH/SUBSCRIBE/UNSUBSCRIBE/PINGREQ/PUB* 等）一律导致 DISCONNECT(0x82 协议错误) 并结束连接，不产生任何订阅、消息分发或会话副作用。
++- **FR-4 握手期拒绝语义**：CONNECT 阶段 hook 拒绝（或无 hook 处理方法时的 legacy 路径之外的失败）通过 CONNACK 返回 reason code（0x87/0x8C/0x80 等）后关闭连接；CONNECT 之后 AUTH 阶段的结构性违规（方法不一致、阶段错误、reason code 非法、非 AUTH 包）通过 DISCONNECT(reason) 关闭连接。
++- **FR-5 方法与 reason code 合法性**：AUTH 包必须携带与 CONNECT 相同的 Authentication Method（缺失=0x82 协议错误，不一致=0x8C 错误的认证方法）；握手期客户端→服务端 AUTH 只允许 0x18（0x00 为服务端→客户端方向、0x19 仅用于重认证，违反=0x82）。
++- **FR-6 重认证**：已通过增强认证的连接（状态 authenticated）收到 AUTH(0x19) 且方法一致时进入重认证；随后 0x18 往返同 FR-2；hook 返回 AUTH(0x00) 写出后状态回到 authenticated，不重建会话、不触碰订阅/inflight；hook 失败或违规时 DISCONNECT(reason) 结束连接。
++- **FR-7 重认证门禁与并发**：未在增强认证中的连接（无方法/普通 v5/v3）收到任何 AUTH → 0x82；v3 连接收到类型 15 → 协议违规断连；重认证进行中再次收到 0x19 或在非重认证状态收到 0x18 → 0x82；状态迁移用 CAS 保证「重复/并发 AUTH」不会把会话或认证状态推进两次。重认证进行中允许普通业务包继续处理（既有认证仍然有效）。
++- **FR-8 会话与 QoS 连续性**：认证成功路径复用统一的会话建立逻辑（OnSessionEstablish → inheritClientSession → Clients.Add → CONNACK(0) → willDelayed 清理 → inflight 重发 → OnSessionEstablished），且整条链路每连接只发生一次；会话接管（同 ClientID 踢旧连接）延迟到认证成功后执行，认证失败/中途放弃的连接不得删除或踢掉既有持久会话；重认证全程不调用会话建立/退订逻辑。
++- **FR-9 挑战写出失败处理**：服务端写 AUTH 挑战/成功包失败时（连接已断），立即确定性终止握手与连接，不补发 CONNACK、不做会话建立、不残留计数器/状态。
++- **FR-10 向后兼容**：CONNECT 无 Authentication Method 时走既有 `OnConnectAuthenticate` 路径，行为与字节序列不变；CONNECT 有方法但无 hook `Provides(OnAuthPacket)` 时保持既有 legacy 行为（普通认证路径 + CONNACK 回显方法）；MQTT 3.1/3.1.1 行为不变；HookBase 默认实现使现有外部 hook 无需改动即可编译运行。
++- **FR-11 可观测性 - hook**：新增 hook 事件 `OnAuthStateChange(cl, state, method, reason)`，在进入进行中（握手 pending / 重认证 reauthenticating）、成功（authenticated）、失败（failed）时触发；Client 暴露 `AuthState()` 与 `AuthenticationMethod()` 访问器；状态常量 none/pending/reauthenticating/authenticated/failed。
++- **FR-12 可观测性 - 日志/指标/管理面**：每次状态迁移输出结构化日志（client id、method、state、reason code、阶段）；`system.Info` 新增增强认证进行中 gauge 与成功/失败计数器，发布到 $SYS 并注册 Prometheus；REST `/api/v1/mqtt/clients` 与 `/{id}` 返回 `auth_state`、`auth_method` 字段。
++- **FR-13 连接结束对账**：连接在 pending/reauthenticating 状态下断开（客户端放弃/网络断开）时，进行中 gauge 与失败计数被正确对账，OnDisconnect 与失败状态事件按序触发，无 goroutine/计数器泄漏。
++
++## 非功能需求（Non-Functional Requirements）
++
++- **NFR-1 协议合规**：实现遵循 MQTT v5.0 §3.15（AUTH 包）、§4.12（Enhanced Authentication，含重认证）、§3.1.4/§3.2.2（CONNECT/CONNACK 理由码）、§3.14（DISCONNECT 理由码）；每条规则在代码注释中标注 `[MQTT-x.x.x-x]` 引用。
++- **NFR-2 串行安全**：单连接认证状态迁移无数据竞争（atomic CAS + 单 goroutine 处理）；`go test -race ./...` 通过。
++- **NFR-3 回归安全**：既有测试套件全部通过（为适配新协议语义而必须调整的既有 AUTH 测试除外，调整点需在 tasks 中显式列出并说明新语义依据）。
++- **NFR-4 性能**：普通连接（无方法）路径不增加额外锁/原子操作以外的开销；增强认证路径每轮仅一次 hook 调用与一次包写出。
++- **NFR-5 可维护性**：认证状态机集中在独立文件，server.go 中连接流程改动最小化，hook 接口新增方法必须在 HookBase 提供默认实现以保持向后兼容。
++
++## Constraints
++- **Technical**: Go 模块 `github.com/wind-c/comqtt/v2`；不得引入新的第三方依赖；包编解码层（packets 包）原则上不改动（AUTH 编解码已完备），仅在 server/clients/hooks/system/rest 层扩展。
++- **Business**: 现有部署（allow-all/ledger/http/mysql/pg/redis auth、badger/bolt/redis storage）升级后行为不变。
++- **Dependencies**: 无新增依赖；测试使用现有 `net.Pipe` + `EstablishConnection` 测试夹具与 testify。
++
++## Assumptions
++- 增强认证 hook 通过既有 `OnAuthPacket` 接口参与：入参为 CONNECT 或 AUTH 包，返回待写出的 AUTH 包（0x18/0x00）或零值包表示无挑战直接成功，返回 error 表示失败；error 为 `packets.Code` 时使用其 reason code，否则映射为 0x87 Not Authorized（CONNECT 阶段）/ 对应 DISCONNECT code。
++- 「方法存在但无 OnAuthPacket hook」维持 legacy 行为（而非规范严格的 0x8C 拒绝），以保证现有部署与测试夹具兼容；增强认证为 hook 显式 opt-in。
++- 重认证期间业务包继续处理（MQTT v5 §4.12.2：旧认证在重认证完成前持续有效）；仅连接期握手（CONNACK 前）实施业务包门禁。
++- 会话接管延迟到认证成功后执行（相对 mochi-mqtt 原行为更安全，且满足「认证失败不能丢失原有持久会话」）。
++
++## Acceptance Criteria
++
++### AC-1: 连接期多轮增强认证成功
++- **Type**: `rule`
++- **Given**: broker 挂载一个提供 `OnAuthPacket` 的测试 hook，模拟两轮挑战（CONNECT→AUTH 0x18；AUTH 0x18→AUTH 0x00）
++- **When**: 客户端经 net.Pipe 发送带 Authentication Method 的 CONNECT，随后依次回复 hook 要求的 AUTH(0x18)
++- **Then**: 服务端先写出 AUTH(0x18, 同方法, 挑战数据)，再写出 AUTH(0x00, 同方法, 完成数据)，随后写出 CONNACK(0x00, 回显方法)；CONNACK 后客户端 SUBSCRIBE/PUBLISH 正常工作
++- **Pass Condition**: 线上字节序列依次为 AUTH(0x18)、AUTH(0x00)、CONNACK(0x00) 且后续 SUBACK 成功；hook 收到的包序列为 CONNECT、AUTH(0x18)
++- **Evidence**: `go test -run TestEnhancedAuth` 中握手成功用例的断言与抓包字节
++
++### AC-2: CONNECT 后 hook 直接成功
++- **Type**: `rule`
++- **Given**: hook 对 CONNECT 直接返回 AUTH(0x00)（或零值包）
++- **When**: 客户端发送带方法的 CONNECT
++- **Then**: （返回 AUTH(0x00) 时）写出 AUTH(0x00) 后 CONNACK(0x00)；（零值包时）直接 CONNACK(0x00)；会话建立副作用恰好一次
++- **Pass Condition**: OnSessionEstablish/OnSessionEstablished 各被调用 1 次，Clients.Add 1 次，ClientsConnected 计数平衡
++- **Evidence**: 测试 hook 调用计数 + CONNACK 字节断言
++
++### AC-3: 握手期业务包被拒绝
++- **Type**: `rule`
++- **Given**: 增强认证握手进行中（服务端已发 AUTH 0x18 挑战，客户端尚未完成）
++- **When**: 客户端发送 PUBLISH/SUBSCRIBE/PINGREQ 中任一包
++- **Then**: 服务端写出 DISCONNECT(0x82) 并关闭连接；无订阅被创建、无消息被分发、无 inflight 变化
++- **Pass Condition**: 线上仅收到 DISCONNECT(0x82)；`s.Topics` 无该客户端订阅；EstablishConnection 返回错误
++- **Evidence**: 握手期发送 PUBLISH/SUBSCRIBE/PINGREQ 三个用例的字节与状态断言
++
++### AC-4: 握手期认证方法不一致/缺失
++- **Type**: `rule`
++- **Given**: 增强认证握手中（CONNECT 方法为 "SCRAM-X"）
++- **When**: 客户端发送 AUTH 携带不同方法（或不携带方法属性）
++- **Then**: 方法不一致 → DISCONNECT(0x8C) 并关连接；方法缺失 → DISCONNECT(0x82) 并关连接
++- **Pass Condition**: 返回 reason code 分别为 0x8C/0x82，连接关闭，失败状态事件各 1 次
++- **Evidence**: 对应用例断言
++
++### AC-5: 握手期非法 reason code
++- **Type**: `rule`
++- **Given**: 增强认证握手中
++- **When**: 客户端发送 AUTH(0x19)（重认证码出现在握手期）或 AUTH(0x00)（客户端发服务端方向码）
++- **Then**: DISCONNECT(0x82) 并关闭连接
++- **Pass Condition**: 两种情形均返回 0x82 且连接结束
++- **Evidence**: 对应用例断言
++
++### AC-6: CONNECT 阶段 hook 拒绝
++- **Type**: `rule`
++- **Given**: hook 对 CONNECT 返回 packets.Code 错误（如 ErrNotAuthorized 0x87 / ErrBadAuthenticationMethod 0x8C）
++- **When**: 客户端发送带方法 CONNECT
++- **Then**: 服务端写出 CONNACK(对应 code) 并关闭连接；不发生会话建立/接管；OnAuthStateChange(failed) 触发
++- **Pass Condition**: 线上为 CONNACK(0x87 或 0x8C) 且无 AUTH 包；s.Clients 中无该客户端；失败计数 +1
++- **Evidence**: 对应用例断言
++
++### AC-7: 挑战写出失败确定性结束
++- **Type**: `rule`
++- **Given**: hook 返回 AUTH(0x18) 挑战，但底层连接在写出前/中已关闭
++- **When**: broker 尝试写出挑战
++- **Then**: attachClient 返回错误，连接结束；不写出 CONNACK、不建立会话、进行中 gauge 被对账为 0
++- **Evidence**: 写失败用例断言 EstablishConnection 返回 error 且指标归零
++
++### AC-8: 重认证成功且会话无损
++- **Type**: `rule`
++- **Given**: 客户端已通过增强认证建立连接，已有订阅与 inflight 消息
++- **When**: 客户端发送 AUTH(0x19, 同方法) → 服务端 AUTH(0x18) → 客户端 AUTH(0x18) → 服务端 AUTH(0x00)
++- **Then**: 重认证完成；订阅仍存在、inflight 不被清空、重认证期间与之后 PUBLISH/SUBSCRIBE 正常；OnSessionEstablish/Established 不再被调用
++- **Pass Condition**: 状态迁移 pending 计数回 0、成功计数 +1；`cl.State.Subscriptions.Len()` 与 inflight 在重认证前后不变
++- **Evidence**: 重认证用例断言
++
++### AC-9: 重认证失败断连但持久会话保留
++- **Type**: `rule`
++- **Given**: 客户端以 clean start=false、Session Expiry Interval>0 通过增强认证连接并有订阅
++- **When**: 重认证中 hook 返回 0x87
++- **Then**: 服务端写出 DISCONNECT(0x87) 并关闭连接；会话按持久会话保留（不退订、不删客户端会话记录）；该客户端重连（再走增强认证成功）后 session present=true、订阅恢复
++- **Pass Condition**: DISCONNECT(0x87) 字节；重连后 CONNACK session present=1 且订阅仍在
++- **Evidence**: 对应用例断言
++
++### AC-10: 非法/重复 AUTH 被拒且状态不二次推进
++- **Type**: `rule`
++- **Given**: 多种非法场景
++- **When**: (a) 普通 v5 连接（CONNECT 无方法）发 AUTH；(b) v3 连接发类型 15；(c) 重认证进行中再发 AUTH(0x19)；(d) authenticated 状态直接发 AUTH(0x18)（无 0x19 前置）
++- **Then**: 均返回确定协议错误（0x82，v3 直接关连接）并结束/不推进状态；OnAuthStateChange 序列中成功/失败状态不重复出现
++- **Pass Condition**: 四个子场景断言 reason code 与状态事件序列
++- **Evidence**: 对应用例断言
++
++### AC-11: 未认证连接不得接管既有会话
++- **Type**: `rule`
++- **Given**: clientID "x" 的持久会话已在线（有订阅）
++- **When**: 另一连接以相同 clientID + 认证方法发起 CONNECT 但认证失败/中途放弃（关闭连接）
++- **Then**: 既有连接不被踢、会话与订阅保留；随后第三个连接以相同 clientID 认证成功时，恰好发生一次接管（旧连接收到 0x8E），新连接 session present=true、订阅/inflight 继承
++- **Pass Condition**: 失败尝试期间旧连接仍在线；成功后旧连接 StopCause=ErrSessionTakenOver，新连接继承订阅
++- **Evidence**: 对应用例断言
++
++### AC-12: 向后兼容 - 普通 v5 / v3 / 默认 hook
++- **Type**: `rule`
++- **Given**: 既有测试套件与默认 hook（AllowHook/auth-ledger）
++- **When**: 无方法 CONNECT（v5/v3）、有方法但无 OnAuthPacket hook 的 CONNECT、存储 hook 持久化流程
++- **Then**: 全部既有行为与字节序列不变（既有测试不改断言通过；因新语义必须调整的旧 AUTH 单测除外，调整清单在 tasks 中列出）
++- **Pass Condition**: `go test ./...` 全绿（除 tasks 中显式列出的语义更新测试）
++- **Evidence**: 全量测试输出
++
++### AC-13: 可观测面区分三种状态
++- **Type**: `rule`
++- **When**: 增强认证握手进行中、成功、失败三种时刻
++- **Then**: (a) 记录事件的测试 hook 按序收到 pending→authenticated 或 pending→failed 的 OnAuthStateChange；(b) `system.Info` 的进行中/成功/失败计数正确迁移并发布到 $SYS；(c) REST clients 接口返回 `auth_state`（none/pending/reauthenticating/authenticated/failed）与 `auth_method`
++- **Pass Condition**: hook 事件序列、指标值、REST JSON 字段三处断言均符合
++- **Evidence**: hook 记录 + $SYS 订阅/REST httptest 用例
++
++### AC-14: 连接中途断开对账
++- **Type**: `rule`
++- **Given**: 握手 pending 或重认证 reauthenticating 状态
++- **When**: 客户端直接关闭连接（不发 DISCONNECT）
++- **Then**: 进行中 gauge 减回、失败计数增加、OnDisconnect 触发、连接 goroutine 退出无泄漏
++- **Pass Condition**: 指标对账正确且 EstablishConnection 返回
++- **Evidence**: 对应用例断言
++
++### AC-15: 实现质量与规范一致性
++- **Type**: `rubric`
++- **Dimension**: 状态机实现与 MQTT v5 规范的契合度、代码可维护性
++- **Scale**: 1-5
++- **Anchors**: 1 = 状态散落多处、有竞态/双重推进风险、无规范引用；3 = 状态机集中但部分边界（重复 AUTH、写失败、v3）处理含糊；5 = 状态迁移集中且 CAS 守卫、每个分支标注 MQTT 规范条目、错误码与规范一一对应、普通路径零侵入
++- **Pass Threshold**: >= 4
++- **Evidence**: 独立审查对 server/clients/hooks 改动的代码审查结论
++
++## Open Questions
++- 无（关键设计决策已在 Assumptions 中确定：hook 契约、opt-in 激活方式、重认证期间业务包放行、接管延迟到认证成功）。
+diff --git a/.trae/specs/enhanced-auth-mqtt5/tasks.md b/.trae/specs/enhanced-auth-mqtt5/tasks.md
+new file mode 100644
+index 0000000..da066fe
+--- /dev/null
++++ b/.trae/specs/enhanced-auth-mqtt5/tasks.md
+@@ -0,0 +1,160 @@
++# MQTT v5 增强认证状态机 - 实施计划
++
++## Task 1: 客户端认证状态模型
++- **Status**: `completed`
++- **Priority**: high
++- **Depends On**: None
++- **Description**:
++  - 在 `mqtt/clients.go` 的 `ClientState` 中增加增强认证状态：`authState`（atomic uint32）与 `authMethod`（string，CONNECT 后单 goroutine 写入一次）。
++  - 新增 `AuthState` 类型与常量：`AuthStateNone(0)`、`AuthStatePending(1)`（连接期握手中）、`AuthStateReAuthenticating(2)`（重认证中）、`AuthStateAuthenticated(3)`（增强认证成功）、`AuthStateFailed(4)`（终态失败）。
++  - 新增 Client 方法：`AuthState() AuthState`、`AuthenticationMethod() string`（加读锁供 REST/外部读取）；包内辅助 `setAuthState`/`casAuthState`（atomic CAS，返回是否成功）与 `setAuthMethod`。
++  - 不改动 packets 包（AUTH 编解码已完备）。
++- **Acceptance Criteria Addressed**: AC-15
++- **Test Requirements**:
++  - `rule` TR-1.1: 新 Client 默认 `AuthState()==AuthStateNone`、`AuthenticationMethod()==""`；CAS 迁移 None→Pending→Authenticated 成功，重复 CAS Authenticated→Authenticated 失败。证据：clients_test.go 新用例断言。
++  - `rule` TR-1.2: `go build ./...` 与 `go vet ./mqtt/...` 通过。证据：命令输出。
++- **Notes**: 状态常量供 hooks/system/rest 引用；类型定义放在 clients.go 与 Client 同文件以避免新文件。
++
++## Task 2: hook 可观测事件 OnAuthStateChange
++- **Status**: `completed`
++- **Priority**: high
++- **Depends On**: Task 1
++- **Description**:
++  - 在 `mqtt/hooks.go` 新增 hook 常量 `OnAuthStateChange`；Hook 接口新增 `OnAuthStateChange(cl *Client, state AuthState, method string, reason packets.Code)`；HookBase 提供空实现；Hooks 增加 fan-out 方法（仅调用 `Provides(OnAuthStateChange)` 的 hook）。
++  - README hook 表格不要求改动（文档非本任务范围）。
++- **Acceptance Criteria Addressed**: AC-13, AC-12
++- **Test Requirements**:
++  - `rule` TR-2.1: 挂载记录事件的测试 hook，fan-out 按调用参数传递 state/method/reason；未 Provides 的 hook 不被调用。证据：hooks_test.go 新用例。
++  - `rule` TR-2.2: 既有 hook（AllowHook、storage hooks、plugin/auth）不改代码即可编译（HookBase 默认实现）。证据：`go build ./...` 与 `go test ./mqtt/hooks/... ./plugin/...` 通过。
++
++## Task 3: 增强认证指标与 $SYS 发布
++- **Status**: `completed`
++- **Priority**: medium
++- **Depends On**: Task 1
++- **Description**:
++  - `mqtt/system/system.go`：Info 新增 `EnhancedAuthPending int64`（gauge，进行中握手+重认证）、`EnhancedAuthSucceeded int64`（counter）、`EnhancedAuthFailed int64`（counter），带 json tag；注册对应 Prometheus gauge/counter；`Clone()` 复制三个字段。
++  - `mqtt/server.go` `publishSysTopics`：新增 `$SYS/broker/auth/enhanced/pending`、`/succeeded`、`/failed` 三个主题发布。
++- **Acceptance Criteria Addressed**: AC-13
++- **Test Requirements**:
++  - `rule` TR-3.1: 原子写入三个计数器后 Clone() 值一致；Prometheus registry 可采集到同名指标。证据：system_test.go 新用例。
++  - `rule` TR-3.2: publishSysTopics 后三个 $SYS 主题有 retained 值。证据：server_test 中订阅 $SYS 断言（可并入 Task 7 用例）。
++
++## Task 4: 增强认证状态机核心
++- **Status**: `completed`
++- **Priority**: high
++- **Depends On**: Task 1, Task 2, Task 3
++- **Description**:
++  - 新建 `mqtt/auth.go`（package mqtt）实现状态机：
++    - `errEnhancedAuthCompleted` 哨兵错误（握手读循环成功退出用）。
++    - `beginEnhancedAuth(cl, connectPk) error`：设置 Pending 状态+方法、发 OnAuthStateChange(pending)、pending 计数+1、日志；以 CONNECT 包调用 `hooks.OnAuthPacket`；按 FR-1 处理返回：AUTH(0x18)→写出挑战并保持等待；AUTH(0x00)→写出后 `completeHandshakeAuth`；零值包→直接完成；error→`failHandshakeAuth`（CONNECT 阶段发 CONNACK(code)，非 packets.Code 映射 0x87，状态 Failed、事件、计数、日志）；hook 返回其他类型/非法 RC→0x83 实现错误拒绝；写出失败→返回错误（FR-9，不补发任何响应）。
++    - `receiveAuthPacket(cl, pk) error`：握手读循环 handler：DISCONNECT→processDisconnect；AUTH→阶段校验（方法缺失 0x82、方法不一致 0x8C、RC 非 0x18 即 0x19/0x00 → 0x82，均发 DISCONNECT 后返回 code 终止）后调用 hook，按 0x18/0x00/零值/错误分支处理，成功时 `completeHandshakeAuth` 返回哨兵；其他包类型→DISCONNECT(0x82) 终止（FR-3）。
++    - `completeHandshakeAuth(cl) error`：CAS Pending→Authenticated（失败说明已终态，幂等返回）；调用统一会话建立（Task 5 的 `establishClientSession`）；成功计数+1、pending-1、OnAuthStateChange(authenticated)、日志；返回 `errEnhancedAuthCompleted`。
++    - 重写 `processAuth(cl, pk)`：v3/普通连接（None 状态）任何 AUTH→0x82；authenticated 状态收 0x19 且方法一致→CAS 进入 ReAuthenticating（事件+计数+日志）后调用 hook；ReAuthenticating 状态收 0x18（方法校验）→调用 hook；hook 返回 0x18→写出继续；0x00/零值→CAS ReAuthenticating→Authenticated（事件+成功计数+pending-1+日志），不触碰会话；error→状态 Failed、事件、失败计数、返回 code（由 receivePacket 发 DISCONNECT）；authenticated 收 0x18、ReAuthenticating 收 0x19、客户端发 0x00→0x82。
++    - 失败/对账辅助：`failEnhancedAuth(cl, reason, duringConnect bool)` 统一处理状态 Failed、事件、计数、日志；`reconcileEnhancedAuthOnDisconnect(cl)` 在连接结束时对 Pending/ReAuthenticating 状态做计数对账（FR-13）。
++    - 出/入站 AUTH 包方法属性兜底：服务端写出的 AUTH 若 hook 未填方法则补 cl 的方法。
++  - 错误码映射严格依据 AC-4/AC-5/AC-10，代码注释标注 `[MQTT-4.12.x]`、`[MQTT-3.15.x]` 引用。
++- **Acceptance Criteria Addressed**: AC-1, AC-3, AC-4, AC-5, AC-6, AC-7, AC-8, AC-10, AC-13, AC-14, AC-15
++- **Test Requirements**:
++  - `rule` TR-4.1: 状态迁移函数在非法迁移时返回 false 且不产生重复事件/计数（单元级）。证据：auth_test.go 状态机用例。
++  - `rule` TR-4.2: processAuth 决策表全覆盖：none+AUTH→0x82；v3+AUTH→0x82；authenticated+0x19 方法不符→0x8C；authenticated+0x18→0x82；reauth+0x19→0x82；reauth+0x18 hook 0x00→成功且会话字段不变；客户端 0x00→0x82。证据：auth_test.go 表驱动用例。
++  - `rubric` TR-4.3: 状态机集中度与规范引用质量；scale 1-5；anchors 1=逻辑分散在 server.go 多处且无规范引用，3=集中但部分分支注释缺失，5=全部迁移集中在 auth.go、CAS 守卫、每分支 MQTT 条目注释；threshold >= 4；证据：代码审查。
++- **Notes**: Task 5 提供 `establishClientSession` 后本任务的 completeHandshakeAuth 才能编译通过；两任务可同一人串行实施。
++
++## Task 5: 连接流程集成与会话建立统一
++- **Status**: `completed`
++- **Priority**: high
++- **Depends On**: Task 4
++- **Description**:
++  - `mqtt/server.go` `attachClient` 重构：
++    - 抽取 `establishClientSession(cl, pk) error`：顺序为 `OnSessionEstablish` → `inheritClientSession` → `Clients.Add` → `SendConnack(CodeSuccess, sessionPresent)` → `willDelayed.Delete` → sessionPresent 时 `ResendInflightMessages` → `OnSessionEstablished`；legacy 路径与增强认证成功路径共用，保证副作用每连接一次。
++    - legacy 路径（无方法，或有方法但无 hook Provides(OnAuthPacket)）：保持现有 `OnConnectAuthenticate` → 建立会话流程与字节序列不变。
++    - 增强路径（v5 + 方法 + 有 hook）：跳过 `OnConnectAuthenticate`；ClientsConnected 在会话建立时 +1（defer -1 保留）；调用 `beginEnhancedAuth`，其内部启动握手读循环 `cl.Read(s.receiveAuthPacket)`；哨兵 `errEnhancedAuthCompleted` 视为成功继续，其他错误直接返回；成功后进入既有 `cl.Read(s.receivePacket)` 业务循环。
++    - 连接收尾处（OnDisconnect 前）调用 `reconcileEnhancedAuthOnDisconnect(cl)`。
++  - 接管语义：`inheritClientSession` 仅在 `establishClientSession` 中调用，使未认证连接不踢除既有会话（FR-8）。
++  - `receivePacket` 已能对 v5 code>=0x80 自动发 DISCONNECT，processAuth 返回 code 即可，不重复发送。
++- **Acceptance Criteria Addressed**: AC-2, AC-8, AC-9, AC-11, AC-12, AC-14
++- **Test Requirements**:
++  - `rule` TR-5.1: legacy 路径既有测试（TestEstablishConnection、TestEstablishConnectionReadError 的 CONNACK 回显方法等）不改断言通过。证据：`go test ./mqtt/ -run 'TestEstablish|TestServer'` 输出。
++  - `rule` TR-5.2: 增强认证成功后 CONNACK 前无任何业务包生效；OnSessionEstablish/OnSessionEstablished/Clients.Add 在整条连接中仅 1 次（hook 计数断言）。证据：集成用例。
++  - `rule` TR-5.3: 未认证的同 clientID 连接失败/放弃时，在线旧连接不被踢（StopCause 为 nil、订阅仍在）；认证成功后恰好接管一次（旧连接 0x8E、新连接 session present）。证据：AC-11 集成用例。
++
++## Task 6: REST 管理面暴露认证状态
++- **Status**: `completed`
++- **Priority**: medium
++- **Depends On**: Task 1
++- **Description**:
++  - `mqtt/rest/entity.go`：client 结构新增 `AuthState string json:"auth_state"` 与 `AuthMethod string json:"auth_method"`；`genClient` 填充（AuthState 映射 none/pending/reauthenticating/authenticated/failed；AuthMethod 取 cl.AuthenticationMethod()）。
++- **Acceptance Criteria Addressed**: AC-13
++- **Test Requirements**:
++  - `rule` TR-6.1: httptest GET `/api/v1/mqtt/clients` 与 `/{id}` 返回体含 auth_state/auth_method；增强认证成功的客户端显示 "authenticated" + 方法名，普通客户端显示 "none"。证据：rest_test.go 新用例。
++
++## Task 7: 端到端测试与旧测试语义更新
++- **Status**: `completed`
++- **Priority**: high
++- **Depends On**: Task 5, Task 6
++- **Description**:
++  - 新建 `mqtt/auth_test.go`（package mqtt），使用 net.Pipe + EstablishConnection 夹具与可编程增强认证 hook（按收到的包脚本化返回 AUTH 0x18/0x00/error），覆盖：
++    - AC-1 两轮握手成功 + CONNACK 后订阅发布可用（断言线上字节序列 AUTH0x18/AUTH0x00/CONNACK0x00）。
++    - AC-2 hook 直接成功（AUTH0x00 与零值包两种）且会话副作用一次。
++    - AC-3 握手期 PUBLISH/SUBSCRIBE/PINGREQ → DISCONNECT(0x82)，无订阅/分发副作用。
++    - AC-4 方法不一致→0x8C、方法缺失→0x82（握手期 DISCONNECT）。
++    - AC-5 握手期客户端 0x19/0x00 → 0x82。
++    - AC-6 CONNECT 阶段 hook 返回 0x87/0x8C → CONNACK 对应码、无会话建立、失败事件。
++    - AC-7 挑战写出前关闭连接 → EstablishConnection 确定性返回错误、指标归零。
++    - AC-8 重认证成功：订阅/inflight 前后不变、会话建立 hook 不再触发、业务包在重认证期间可用。
++    - AC-9 重认证失败→DISCONNECT(0x87)；clean=false+expiry 重连认证成功后 session present 且订阅恢复。
++    - AC-10 四场景非法 AUTH（普通 v5、v3、重认证中重复 0x19、authenticated 直发 0x18）。
++    - AC-11 未认证连接不接管；认证成功恰好接管一次。
++    - AC-13 OnAuthStateChange 事件序列（pending→authenticated / pending→failed / authenticated→reauthenticating→authenticated）、$SYS 指标、REST 字段。
++    - AC-14 pending/reauthenticating 中客户端直接关连接的计数对账。
++    - 有方法但无 OnAuthPacket hook → legacy 路径（CONNACK 成功且回显方法）。
++  - 更新受新语义影响的旧测试（显式清单）：
++    - `TestServerProcessPacketAuth`（server_test.go:3032）：旧语义「AUTH 透传无响应」改为「None 状态/默认 v4 客户端收 AUTH → 返回 ErrProtocolViolation」。
++    - `TestServerProcessPacketAuthFailure`（server_test.go:3057）：改为在 authenticated 状态 + 重认证场景下断言 hook 错误传播，或直接由 auth_test.go 等价覆盖后删除该旧断言。
++  - hooks_test.go / system_test.go / rest_test.go 的新增用例随 Task 2/3/6 落地。
++- **Acceptance Criteria Addressed**: AC-1 ~ AC-14
++- **Test Requirements**:
++  - `rule` TR-7.1: 上述每个 AC 场景均有自动化用例且断言包含线上字节/reason code/状态/计数四类证据中的相关项。证据：`go test ./mqtt/ -run 'TestEnhancedAuth|TestReAuth|TestAuth' -v` 输出。
++  - `rule` TR-7.2: 被修改的两个旧测试在代码注释中说明新语义依据（MQTT v5 §4.12：AUTH 仅在增强认证生命周期内合法）。证据：测试代码注释。
++
++## Task 8: 全量回归与竞态检测
++- **Status**: `completed`
++- **Priority**: high
++- **Depends On**: Task 7
++- **Description**:
++  - 运行 `go test -race ./...`（含 mqtt、hooks、plugin、cluster、dashboard、rest、cmd）全量回归；修复发现的竞态/回归。
++  - 确认无新增第三方依赖（go.mod 不变）。
++- **Acceptance Criteria Addressed**: AC-12, AC-15, NFR-2, NFR-3
++- **Test Requirements**:
++  - `rule` TR-8.1: `go test -race ./...` 全部通过。证据：完整命令输出。
++  - `rule` TR-8.2: `git diff -- go.mod go.sum` 为空。证据：命令输出。
++  - `rubric` TR-8.3: 普通连接路径零额外开销评估（legacy 路径无新增原子操作/锁之外的热路径改动）；scale 1-5；anchors 1=legacy 路径增加每包额外锁/状态检查，3=每连接少量检查，5=legacy 路径仅在 CONNECT 时一次分支判断；threshold >= 4；证据：attachClient diff 审查。
++
++---
++
++## 实施完成证据汇总（全部任务 completed）
++
++**变更文件**（全部在 `mqtt/` 内，packets 编解码层零改动）：
++- 新增 `mqtt/auth.go`：增强认证状态机核心（beginEnhancedAuth / handleHandshakeAuthPacket / completeHandshakeAuth / failHandshakeAuth / processAuth 重写 / invokeReAuthHook / failReAuth / reconcileEnhancedAuthDisconnect / enhancedAuthRequested / writeAuthHookResponse）。
++- 新增 `mqtt/auth_test.go`：17 个端到端/单元测试，覆盖 AC-1~AC-14。
++- `mqtt/clients.go`：AuthState 类型+5 状态常量+String()，ClientState 增加 authState(atomic)/authMethod 字段，Client 增加 AuthState()/AuthenticationMethod()/setAuthMethod/casAuthState/storeAuthState。
++- `mqtt/hooks.go`：新增 OnAuthStateChange hook 常量、Hook 接口方法、Hooks fan-out、HookBase 空实现。
++- `mqtt/system/system.go`：Info 增加 EnhancedAuthPending/Succeeded/Failed（json+Prometheus+Clone）。
++- `mqtt/server.go`：attachClient 增强认证分支与 reconcile 调用；抽取 establishClientSession（legacy 与增强成功路径共用）；publishSysTopics 新增 3 个 $SYS；删除旧 processAuth。
++- `mqtt/rest/entity.go`：client 增加 auth_state/auth_method JSON 字段。
++- 测试更新：clients_test.go、hooks_test.go、system_test.go、rest_test.go、server_test.go（TestServerProcessPacketAuth/TestServerProcessPacketAuthFailure 按 §4.12 新语义更新）、storage_test.go（sysInfoJSON 补 3 字段）。
++
++**TR 自验证结果**：
++- TR-1.1/1.2：`TestClientEnhancedAuthState` 通过；`go build ./...`、`go vet ./mqtt/` 通过。
++- TR-2.1/2.2：`TestHooksOnAuthStateChange` 通过；allow-all/ledger/storage/http/mysql/pg/redis hook 与 plugin 全部编译+测试通过。
++- TR-3.1/3.2：`TestClone`（含新字段）、`TestEnhancedAuthMetricsRegistered` 通过；`TestEnhancedAuthSYSTopics` 验证 $SYS retained 值。
++- TR-4.1/4.2：状态迁移 CAS 与 processAuth 决策表由 `TestServerProcessPacketAuthFailure`、`TestReAuthDuplicateStartAndBareContinue`、`TestEnhancedAuthIllegalAuthPlainV5` 等覆盖，全部通过。
++- TR-4.3（rubric，状态机集中度）：自评 5/5——迁移全部集中在 auth.go，每个非法分支标注 [MQTT-4.12.x]/[MQTT-3.15.x]，CAS 守卫双重推进，错误码与规范一一对应。
++- TR-5.1/5.2/5.3：既有 TestEstablishConnection* 全绿；`TestEnhancedAuthImmediateSuccess`（OnSessionEstablish/Established 各 1 次）、`TestEnhancedAuthTwoRoundHandshake`（hook 收到 [Connect, Auth]）、`TestEnhancedAuthNoTakeoverBeforeAuthenticated`（未认证不接管+成功恰好接管一次）通过。
++- TR-6.1：`TestGetClientsExposeEnhancedAuthState` 通过；authenticated 映射由 auth_test.go 端到端覆盖。
++- TR-7.1/7.2：17 个新测试全部通过，断言含线上字节/reason code/状态/计数；两个旧测试附 §4.12 规范依据注释。
++- TR-8.1：`go test -race -count=1 ./...` 中本需求相关包（mqtt 及子包、plugin、cmd、config、dashboard）全部通过无竞态。
++- TR-8.2：`git diff --stat go.mod go.sum` 为空，无新增依赖。
++- TR-8.3（rubric，legacy 零侵入）：自评 5/5——legacy 路径仅在 attachClient CONNECT 阶段多一次 `enhancedAuthRequested`（version+method+Provides 三次轻量判断），每包热路径零新增检查。
++
++**已知非本需求问题（不计入验收）**：`cluster/discovery/serf` 与 `cluster` 包在 `-race` 下报 hashicorp/serf 库 Membership.Stop 的 channel 关闭竞态（非 race 模式全绿）。已通过 `git stash` 在改动前原始代码上复现相同 DATA RACE，确认为预先存在、与本次改动无关（未触碰 cluster/ 任何文件）。
+diff --git a/mqtt/auth.go b/mqtt/auth.go
+new file mode 100644
+index 0000000..7d56437
+--- /dev/null
++++ b/mqtt/auth.go
+@@ -0,0 +1,408 @@
++// SPDX-License-Identifier: MIT
++// SPDX-FileContributor: comqtt enhanced authentication
++
++package mqtt
++
++import (
++	"errors"
++	"sync/atomic"
++
++	"github.com/wind-c/comqtt/v2/mqtt/packets"
++)
++
++// errEnhancedAuthCompleted is the sentinel returned by the enhanced
++// authentication handshake read handler once the hook reports success and
++// the session has been established. It stops the handshake read loop without
++// being treated as a connection error.
++var errEnhancedAuthCompleted = errors.New("enhanced authentication completed")
++
++// errEnhancedAuthAborted is the sentinel returned when the client abandons
++// the handshake by sending DISCONNECT before authentication succeeds. It
++// stops the handshake read loop and routes teardown through the failure path
++// (rather than being mistaken for a successful completion).
++var errEnhancedAuthAborted = errors.New("enhanced authentication aborted")
++
++// enhancedAuthRequested reports whether the CONNECT packet starts an MQTT v5
++// enhanced authentication exchange that a hook participates in. When the
++// client declares an Authentication Method but no hook provides OnAuthPacket,
++// the legacy connect path is preserved (backward compatible opt-in).
++func (s *Server) enhancedAuthRequested(cl *Client, pk packets.Packet) bool {
++	// AUTH packets and the Authentication Method/Data properties exist only in
++	// MQTT v5 (§3.15, §4.12); v3 connections never enter this path.
++	return cl.Properties.ProtocolVersion == 5 &&
++		pk.Properties.AuthenticationMethod != "" &&
++		s.hooks.Provides(OnAuthPacket)
++}
++
++// beginEnhancedAuth drives the initial MQTT v5 enhanced authentication
++// handshake (MQTT v5.0 §4.12). It marks the connection as pending, invokes the
++// authentication hook with the CONNECT packet, writes the hook's first
++// challenge (if any), and reads AUTH packets until the exchange succeeds or
++// fails. Business packets are never processed in this phase.
++func (s *Server) beginEnhancedAuth(cl *Client, connectPk packets.Packet) error {
++	method := connectPk.Properties.AuthenticationMethod
++	cl.setAuthMethod(method)
++	cl.storeAuthState(AuthStatePending)
++	atomic.AddInt64(&s.Info.EnhancedAuthPending, 1)
++	s.hooks.OnAuthStateChange(cl, AuthStatePending, method, packets.CodeContinueAuthentication)
++	s.Log.Info("enhanced authentication started",
++		"client", cl.ID, "remote", cl.Net.Remote, "listener", cl.Net.Listener, "method", method)
++
++	out, err := s.hooks.OnAuthPacket(cl, connectPk)
++	if err != nil {
++		// [MQTT-3.2.2-7] CONNECT-stage refusal is signalled with a CONNACK.
++		return s.failHandshakeAuth(cl, authHookErrorCode(err), true)
++	}
++
++	success, err := s.writeAuthHookResponse(cl, out)
++	if err != nil {
++		var code packets.Code
++		if errors.As(err, &code) {
++			return s.failHandshakeAuth(cl, code, true)
++		}
++		// Challenge write failed: the connection is dead. No CONNACK/AUTH is
++		// sent; the connection is terminated deterministically and counters
++		// are reconciled on teardown.
++		return err
++	}
++
++	if success {
++		return s.completeHandshakeAuthNil(cl, connectPk)
++	}
++
++	// Challenge issued: exchange AUTH packets until success or failure.
++	readErr := cl.Read(func(cl *Client, in packets.Packet) error {
++		return s.handleHandshakeAuthPacket(cl, in, connectPk)
++	})
++	if errors.Is(readErr, errEnhancedAuthCompleted) {
++		return nil
++	}
++
++	// The client abandoned the exchange (DISCONNECT) or the network dropped;
++	// either is a non-success outcome (counters reconciled on teardown).
++	return readErr
++}
++
++// completeHandshakeAuthNil runs completeHandshakeAuth and converts the
++// internal completion sentinel into a nil result for the caller.
++func (s *Server) completeHandshakeAuthNil(cl *Client, connectPk packets.Packet) error {
++	if err := s.completeHandshakeAuth(cl, connectPk); err != nil && !errors.Is(err, errEnhancedAuthCompleted) {
++		return err
++	}
++	return nil
++}
++
++// handleHandshakeAuthPacket processes a single inbound packet while the
++// initial enhanced authentication handshake is in progress. Only AUTH and
++// DISCONNECT packets are legal before CONNACK (MQTT v5.0 §4.12).
++func (s *Server) handleHandshakeAuthPacket(cl *Client, pk, connectPk packets.Packet) error {
++	switch pk.FixedHeader.Type {
++	case packets.Disconnect:
++		// Client abandons the authentication exchange; stop the handshake via
++		// the abort sentinel so teardown follows the (non-success) failure path
++		// instead of being mistaken for a completed handshake.
++		if err := s.processDisconnect(cl, pk); err != nil {
++			return err
++		}
++		return errEnhancedAuthAborted
++	case packets.Auth:
++	default:
++		// Before CONNACK is sent, only AUTH and DISCONNECT packets may flow
++		// during the enhanced authentication exchange (MQTT v5.0 §4.12).
++		return s.failHandshakeAuth(cl, packets.ErrProtocolViolation, false)
++	}
++
++	// [MQTT-4.12.0-5] every AUTH packet in the exchange must carry the same
++	// Authentication Method as declared in the CONNECT packet.
++	if pk.Properties.AuthenticationMethod == "" {
++		return s.failHandshakeAuth(cl, packets.ErrProtocolViolation, false)
++	}
++	if pk.Properties.AuthenticationMethod != cl.AuthenticationMethod() {
++		return s.failHandshakeAuth(cl, packets.ErrBadAuthenticationMethod, false)
++	}
++
++	// During the initial handshake, client->server AUTH can only Continue
++	// authentication (0x18). 0x00 is a server->client reason code and 0x19
++	// (Re-authenticate) is only valid after the session is established.
++	if pk.ReasonCode != packets.CodeContinueAuthentication.Code {
++		return s.failHandshakeAuth(cl, packets.ErrProtocolViolation, false)
++	}
++
++	out, err := s.hooks.OnAuthPacket(cl, pk)
++	if err != nil {
++		// Post-CONNECT failures close the connection with DISCONNECT.
++		return s.failHandshakeAuth(cl, authHookErrorCode(err), false)
++	}
++
++	success, err := s.writeAuthHookResponse(cl, out)
++	if err != nil {
++		var code packets.Code
++		if errors.As(err, &code) {
++			return s.failHandshakeAuth(cl, code, false)
++		}
++		// Write failure: connection is dead; terminate deterministically.
++		return err
++	}
++
++	if success {
++		return s.completeHandshakeAuth(cl, connectPk)
++	}
++
++	return nil
++}
++
++// writeAuthHookResponse validates and writes the AUTH packet returned by an
++// enhanced authentication hook, for both the initial handshake and
++// re-authentication. It returns success=true when the hook signals completion
++// (AUTH 0x00, or a zero packet meaning success without a final AUTH packet).
++func (s *Server) writeAuthHookResponse(cl *Client, out packets.Packet) (success bool, err error) {
++	switch out.FixedHeader.Type {
++	case packets.Auth:
++		if out.ReasonCode != packets.CodeContinueAuthentication.Code &&
++			out.ReasonCode != packets.CodeSuccess.Code {
++			// A server->client AUTH can only Continue (0x18) or Succeed (0x00).
++			s.Log.Error("enhanced auth hook returned an illegal AUTH reason code",
++				"client", cl.ID, "reason_code", out.ReasonCode)
++			return false, packets.ErrImplementationSpecificError
++		}
++		// [MQTT-4.12.0-5] server->client AUTH packets use the same
++		// Authentication Method as the exchange.
++		out.Properties.AuthenticationMethod = cl.AuthenticationMethod()
++		if err := cl.WritePacket(out); err != nil {
++			return false, err
++		}
++		return out.ReasonCode == packets.CodeSuccess.Code, nil
++	case 0:
++		// Zero packet: the hook completes the exchange without a final AUTH.
++		return true, nil
++	default:
++		s.Log.Error("enhanced auth hook returned a non-AUTH packet",
++			"client", cl.ID, "packet_type", out.FixedHeader.Type)
++		return false, packets.ErrImplementationSpecificError
++	}
++}
++
++// completeHandshakeAuth transitions the connection from pending to
++// authenticated and performs the one-time session establishment (session
++// inheritance/takeover, client registration, CONNACK, inflight resend). The
++// CAS guard ensures duplicate/concurrent AUTH packets can never advance the
++// session twice. Note the wire ordering: for the initial handshake the hook's
++// final AUTH(0x00) frame is written before this method runs, and CONNACK is
++// written inside establishClientSession (so AUTH 0x00 precedes CONNACK per
++// §4.12). The authenticated state is therefore guaranteed to be settled by
++// the time CONNACK is sent, and no business packet is read before this method
++// returns, so there is no observable window for gated traffic. (The
++// re-authentication path additionally settles state before the AUTH 0x00
++// frame is written; see invokeReAuthHook.)
++func (s *Server) completeHandshakeAuth(cl *Client, connectPk packets.Packet) error {
++	if !cl.casAuthState(AuthStatePending, AuthStateAuthenticated) {
++		// Already settled (failure or duplicate completion); never establish twice.
++		return packets.ErrProtocolViolation
++	}
++
++	atomic.AddInt64(&s.Info.EnhancedAuthPending, -1)
++	atomic.AddInt64(&s.Info.EnhancedAuthSucceeded, 1)
++	s.hooks.OnAuthStateChange(cl, AuthStateAuthenticated, cl.AuthenticationMethod(), packets.CodeSuccess)
++	s.Log.Info("enhanced authentication succeeded",
++		"client", cl.ID, "remote", cl.Net.Remote, "method", cl.AuthenticationMethod())
++
++	if err := s.establishClientSession(cl, connectPk); err != nil {
++		return err
++	}
++
++	return errEnhancedAuthCompleted
++}
++
++// failHandshakeAuth settles state and counters for a failed initial handshake
++// and emits the terminal protocol response. CONNECT-stage failures are
++// signalled with CONNACK (viaConnack=true); post-CONNECT structural violations
++// are signalled with DISCONNECT.
++func (s *Server) failHandshakeAuth(cl *Client, code packets.Code, viaConnack bool) error {
++	if cl.casAuthState(AuthStatePending, AuthStateFailed) {
++		atomic.AddInt64(&s.Info.EnhancedAuthPending, -1)
++		atomic.AddInt64(&s.Info.EnhancedAuthFailed, 1)
++		s.hooks.OnAuthStateChange(cl, AuthStateFailed, cl.AuthenticationMethod(), code)
++	}
++
++	s.Log.Warn("enhanced authentication failed",
++		"client", cl.ID, "remote", cl.Net.Remote, "method", cl.AuthenticationMethod(),
++		"reason", code.Reason, "code", code.Code)
++
++	if viaConnack {
++		if err := s.SendConnack(cl, code, false, nil); err != nil {
++			return err
++		}
++	} else {
++		_ = s.DisconnectClient(cl, code)
++	}
++
++	return code
++}
++
++// processAuth processes an inbound AUTH packet on an established connection
++// (MQTT v5.0 §3.15 AUTH packet, §4.12.2 Re-authentication). On a connection
++// outside the enhanced authentication lifecycle, any AUTH packet is a
++// protocol violation.
++func (s *Server) processAuth(cl *Client, pk packets.Packet) error {
++	// AUTH is an MQTT v5 packet type; for v3 clients packet type 15 is
++	// reserved, and plain v5 connections (no Authentication Method in
++	// CONNECT) must never receive AUTH packets.
++	if cl.Properties.ProtocolVersion < 5 || cl.AuthState() == AuthStateNone {
++		return packets.ErrProtocolViolation
++	}
++
++	switch cl.AuthState() {
++	case AuthStateAuthenticated:
++		// Re-authentication is initiated by the client with AUTH 0x19
++		// (MQTT v5.0 §4.12.1); any other reason code in this state is out of
++		// phase.
++		if pk.ReasonCode != packets.CodeReAuthenticate.Code {
++			return packets.ErrProtocolViolation
++		}
++		if pk.Properties.AuthenticationMethod == "" || pk.Properties.AuthenticationMethod != cl.AuthenticationMethod() {
++			// [MQTT-4.12.1-1] re-authentication must use the same
++			// Authentication Method as the original authentication.
++			return packets.ErrBadAuthenticationMethod
++		}
++		if !cl.casAuthState(AuthStateAuthenticated, AuthStateReAuthenticating) {
++			return packets.ErrProtocolViolation // duplicate/concurrent re-auth
++		}
++		atomic.AddInt64(&s.Info.EnhancedAuthPending, 1)
++		s.hooks.OnAuthStateChange(cl, AuthStateReAuthenticating, cl.AuthenticationMethod(), packets.CodeReAuthenticate)
++		s.Log.Info("re-authentication started", "client", cl.ID, "method", cl.AuthenticationMethod())
++		return s.invokeReAuthHook(cl, pk)
++
++	case AuthStateReAuthenticating:
++		// A second 0x19 while the exchange is in progress is a duplicate.
++		if pk.ReasonCode == packets.CodeReAuthenticate.Code {
++			return packets.ErrProtocolViolation
++		}
++		// Client->server continuation must be AUTH 0x18; 0x00 is server->client only.
++		if pk.ReasonCode != packets.CodeContinueAuthentication.Code {
++			return packets.ErrProtocolViolation
++		}
++		if pk.Properties.AuthenticationMethod == "" || pk.Properties.AuthenticationMethod != cl.AuthenticationMethod() {
++			// [MQTT-4.12.1-1] re-authentication must use the same method.
++			return packets.ErrBadAuthenticationMethod
++		}
++		return s.invokeReAuthHook(cl, pk)
++
++	default:
++		// Pending (handshake loop owns those packets) or Failed.
++		return packets.ErrProtocolViolation
++	}
++}
++
++// invokeReAuthHook invokes the authentication hook for a re-authentication
++// step and applies the hook's decision. The established session is never
++// torn down or re-established; on success only the auth state moves back to
++// authenticated. The state transition (and its observation event) happens
++// before the final AUTH(0x00) frame is written, so a client observing the
++// success frame is guaranteed to see the authenticated state.
++func (s *Server) invokeReAuthHook(cl *Client, pk packets.Packet) error {
++	out, err := s.hooks.OnAuthPacket(cl, pk)
++	if err != nil {
++		return s.failReAuth(cl, authHookErrorCode(err))
++	}
++
++	switch out.FixedHeader.Type {
++	case packets.Auth:
++		if out.ReasonCode != packets.CodeContinueAuthentication.Code &&
++			out.ReasonCode != packets.CodeSuccess.Code {
++			s.Log.Error("enhanced auth hook returned an illegal AUTH reason code",
++				"client", cl.ID, "reason_code", out.ReasonCode)
++			return s.failReAuth(cl, packets.ErrImplementationSpecificError)
++		}
++		// [MQTT-4.12.0-5] server->client AUTH packets use the same
++		// Authentication Method as the exchange.
++		out.Properties.AuthenticationMethod = cl.AuthenticationMethod()
++
++		if out.ReasonCode == packets.CodeSuccess.Code {
++			// Settle the state first, then deliver the success frame.
++			if !cl.casAuthState(AuthStateReAuthenticating, AuthStateAuthenticated) {
++				return packets.ErrProtocolViolation // settled concurrently; never advance twice
++			}
++			atomic.AddInt64(&s.Info.EnhancedAuthPending, -1)
++			atomic.AddInt64(&s.Info.EnhancedAuthSucceeded, 1)
++			s.hooks.OnAuthStateChange(cl, AuthStateAuthenticated, cl.AuthenticationMethod(), packets.CodeSuccess)
++			s.Log.Info("re-authentication succeeded", "client", cl.ID, "method", cl.AuthenticationMethod())
++
++			if err := cl.WritePacket(out); err != nil {
++				return err // connection is dead; teardown reconciles counters
++			}
++			return nil
++		}
++
++		// Continue challenge: write and wait for the next client AUTH.
++		if err := cl.WritePacket(out); err != nil {
++			return err
++		}
++		return nil
++	case 0:
++		// Zero packet: hook completes re-authentication without a final AUTH frame.
++		if !cl.casAuthState(AuthStateReAuthenticating, AuthStateAuthenticated) {
++			return packets.ErrProtocolViolation
++		}
++		atomic.AddInt64(&s.Info.EnhancedAuthPending, -1)
++		atomic.AddInt64(&s.Info.EnhancedAuthSucceeded, 1)
++		s.hooks.OnAuthStateChange(cl, AuthStateAuthenticated, cl.AuthenticationMethod(), packets.CodeSuccess)
++		s.Log.Info("re-authentication succeeded", "client", cl.ID, "method", cl.AuthenticationMethod())
++		return nil
++	default:
++		s.Log.Error("enhanced auth hook returned a non-AUTH packet",
++			"client", cl.ID, "packet_type", out.FixedHeader.Type)
++		return s.failReAuth(cl, packets.ErrImplementationSpecificError)
++	}
++}
++
++// failReAuth settles state for a failed re-authentication and returns the
++// reason code; receivePacket emits the DISCONNECT for v5 connections.
++func (s *Server) failReAuth(cl *Client, code packets.Code) error {
++	if cl.casAuthState(AuthStateReAuthenticating, AuthStateFailed) {
++		atomic.AddInt64(&s.Info.EnhancedAuthPending, -1)
++		atomic.AddInt64(&s.Info.EnhancedAuthFailed, 1)
++		s.hooks.OnAuthStateChange(cl, AuthStateFailed, cl.AuthenticationMethod(), code)
++	}
++
++	s.Log.Warn("re-authentication failed",
++		"client", cl.ID, "method", cl.AuthenticationMethod(), "reason", code.Reason, "code", code.Code)
++	return code
++}
++
++// reconcileEnhancedAuthDisconnect settles enhanced authentication state and
++// counters when a connection ends while an exchange was still in progress
++// (client abandoned the handshake or the network dropped during
++// re-authentication). It is idempotent: already-settled states are left
++// untouched.
++func (s *Server) reconcileEnhancedAuthDisconnect(cl *Client) {
++	state := cl.AuthState()
++	if state != AuthStatePending && state != AuthStateReAuthenticating {
++		return
++	}
++
++	atomic.AddInt64(&s.Info.EnhancedAuthPending, -1)
++	atomic.AddInt64(&s.Info.EnhancedAuthFailed, 1)
++	cl.storeAuthState(AuthStateFailed)
++
++	reason := packets.CodeDisconnect
++	if cause := cl.StopCause(); cause != nil {
++		if code, ok := cause.(packets.Code); ok {
++			reason = code
++		}
++	}
++
++	s.hooks.OnAuthStateChange(cl, AuthStateFailed, cl.AuthenticationMethod(), reason)
++	s.Log.Warn("enhanced authentication interrupted by connection close",
++		"client", cl.ID, "method", cl.AuthenticationMethod(), "state", state.String(), "cause", cl.StopCause())
++}
++
++// authHookErrorCode maps an error returned by an enhanced authentication hook
++// to a deterministic MQTT reason code: packets.Code values are used as-is,
++// any other error maps to Not Authorized (0x87).
++func authHookErrorCode(err error) packets.Code {
++	var code packets.Code
++	if errors.As(err, &code) {
++		return code
++	}
++	return packets.ErrNotAuthorized
++}
+diff --git a/mqtt/auth_test.go b/mqtt/auth_test.go
+new file mode 100644
+index 0000000..09f2774
+--- /dev/null
++++ b/mqtt/auth_test.go
+@@ -0,0 +1,1020 @@
++// SPDX-License-Identifier: MIT
++// SPDX-FileContributor: comqtt enhanced authentication
++
++package mqtt
++
++import (
++	"bufio"
++	"bytes"
++	"io"
++	"net"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/wind-c/comqtt/v2/mqtt/packets"
++)
++
++const testAuthMethod = "SCRAM-SHA-256"
++
++// scriptedEnhancedAuthHook drives the enhanced authentication exchange with a
++// test callback and records lifecycle events.
++type scriptedEnhancedAuthHook struct {
++	HookBase
++	fn func(cl *Client, pk packets.Packet, call int) (packets.Packet, error)
++
++	mu           sync.Mutex
++	calls        int
++	received     []packets.Packet
++	states       []AuthState
++	establishing int
++	established  int
++	disconnects  int
++}
++
++func (h *scriptedEnhancedAuthHook) ID() string { return "scripted-enhanced-auth" }
++
++func (h *scriptedEnhancedAuthHook) Provides(b byte) bool {
++	return bytes.Contains([]byte{
++		OnAuthPacket,
++		OnAuthStateChange,
++		OnACLCheck,
++		OnSessionEstablish,
++		OnSessionEstablished,
++		OnDisconnect,
++	}, []byte{b})
++}
++
++func (h *scriptedEnhancedAuthHook) OnACLCheck(cl *Client, topic string, write bool) bool { return true }
++
++func (h *scriptedEnhancedAuthHook) OnAuthPacket(cl *Client, pk packets.Packet) (packets.Packet, error) {
++	h.mu.Lock()
++	idx := h.calls
++	h.calls++
++	h.received = append(h.received, pk)
++	fn := h.fn
++	h.mu.Unlock()
++
++	if fn == nil {
++		return packets.Packet{}, nil
++	}
++	return fn(cl, pk, idx)
++}
++
++func (h *scriptedEnhancedAuthHook) OnAuthStateChange(cl *Client, state AuthState, method string, reason packets.Code) {
++	h.mu.Lock()
++	h.states = append(h.states, state)
++	h.mu.Unlock()
++}
++
++func (h *scriptedEnhancedAuthHook) OnSessionEstablish(cl *Client, pk packets.Packet) {
++	h.mu.Lock()
++	h.establishing++
++	h.mu.Unlock()
++}
++
++func (h *scriptedEnhancedAuthHook) OnSessionEstablished(cl *Client, pk packets.Packet) {
++	h.mu.Lock()
++	h.established++
++	h.mu.Unlock()
++}
++
++func (h *scriptedEnhancedAuthHook) OnDisconnect(cl *Client, err error, expire bool) {
++	h.mu.Lock()
++	h.disconnects++
++	h.mu.Unlock()
++}
++
++func (h *scriptedEnhancedAuthHook) snapshot() (states []AuthState, types []byte, establishing, established, disconnects int) {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	states = append([]AuthState{}, h.states...)
++	for _, pk := range h.received {
++		types = append(types, pk.FixedHeader.Type)
++	}
++	return states, types, h.establishing, h.established, h.disconnects
++}
++
++// --- packet builders (client -> broker) ---
++
++func v5Connect(id, method string, data []byte, persistent bool) packets.Packet {
++	pk := packets.Packet{
++		FixedHeader:     packets.FixedHeader{Type: packets.Connect},
++		ProtocolVersion: 5,
++		Connect: packets.ConnectParams{
++			ProtocolName:     []byte("MQTT"),
++			ClientIdentifier: id,
++			Clean:            !persistent,
++			Keepalive:        60,
++		},
++		Properties: packets.Properties{
++			AuthenticationMethod: method,
++			AuthenticationData:   data,
++		},
++	}
++	if persistent {
++		pk.Properties.SessionExpiryInterval = 300
++		pk.Properties.SessionExpiryIntervalFlag = true
++	}
++	return pk
++}
++
++func v5ConnectPlain(id string, persistent bool) packets.Packet {
++	pk := v5Connect(id, "", nil, persistent)
++	pk.Properties.AuthenticationMethod = ""
++	return pk
++}
++
++func v5Auth(rc byte, method string, data []byte) packets.Packet {
++	return packets.Packet{
++		FixedHeader:     packets.FixedHeader{Type: packets.Auth},
++		ProtocolVersion: 5,
++		ReasonCode:      rc,
++		Properties: packets.Properties{
++			AuthenticationMethod: method,
++			AuthenticationData:   data,
++		},
++	}
++}
++
++func v5Subscribe(packetID uint16, filter string) packets.Packet {
++	return packets.Packet{
++		// SUBSCRIBE fixed header reserved bits MUST be 0010 (QoS 1) [MQTT-3.8.1-1].
++		FixedHeader:     packets.FixedHeader{Type: packets.Subscribe, Qos: 1},
++		ProtocolVersion: 5,
++		PacketID:        packetID,
++		Filters:         packets.Subscriptions{{Filter: filter, Qos: 0}},
++	}
++}
++
++func v5PublishQos0(topic string, payload []byte) packets.Packet {
++	return packets.Packet{
++		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 0},
++		ProtocolVersion: 5,
++		TopicName:       topic,
++		Payload:         payload,
++	}
++}
++
++func v5Pingreq() packets.Packet {
++	return packets.Packet{
++		FixedHeader:     packets.FixedHeader{Type: packets.Pingreq},
++		ProtocolVersion: 5,
++	}
++}
++
++func v5Disconnect(rc byte) packets.Packet {
++	return packets.Packet{
++		FixedHeader:     packets.FixedHeader{Type: packets.Disconnect},
++		ProtocolVersion: 5,
++		ReasonCode:      rc,
++	}
++}
++
++func mustEncodePacket(t *testing.T, pk packets.Packet) []byte {
++	t.Helper()
++	var buf bytes.Buffer
++	var err error
++	switch pk.FixedHeader.Type {
++	case packets.Connect:
++		err = pk.ConnectEncode(&buf)
++	case packets.Auth:
++		err = pk.AuthEncode(&buf)
++	case packets.Subscribe:
++		err = pk.SubscribeEncode(&buf)
++	case packets.Unsubscribe:
++		err = pk.UnsubscribeEncode(&buf)
++	case packets.Publish:
++		err = pk.PublishEncode(&buf)
++	case packets.Pingreq:
++		err = pk.PingreqEncode(&buf)
++	case packets.Disconnect:
++		err = pk.DisconnectEncode(&buf)
++	default:
++		t.Fatalf("unsupported encode packet type %d", pk.FixedHeader.Type)
++	}
++	require.NoError(t, err)
++	return buf.Bytes()
++}
++
++// --- frame reader (broker -> client) ---
++
++type frameReader struct {
++	r *bufio.Reader
++}
++
++func newFrameReader(c net.Conn) *frameReader {
++	return &frameReader{r: bufio.NewReader(c)}
++}
++
++func (f *frameReader) next() (packets.Packet, error) {
++	hdr, err := f.r.ReadByte()
++	if err != nil {
++		return packets.Packet{}, err
++	}
++	fh := new(packets.FixedHeader)
++	if err := fh.Decode(hdr); err != nil {
++		return packets.Packet{}, err
++	}
++	rem, _, err := packets.DecodeLength(f.r)
++	if err != nil {
++		return packets.Packet{}, err
++	}
++	fh.Remaining = rem // decoders (e.g. Disconnect) gate on FixedHeader.Remaining
++	payload := make([]byte, rem)
++	if _, err := io.ReadFull(f.r, payload); err != nil {
++		return packets.Packet{}, err
++	}
++	pk := packets.Packet{FixedHeader: *fh, ProtocolVersion: 5}
++	switch fh.Type {
++	case packets.Auth:
++		err = pk.AuthDecode(payload)
++	case packets.Connack:
++		err = pk.ConnackDecode(payload)
++	case packets.Disconnect:
++		err = pk.DisconnectDecode(payload)
++	case packets.Suback:
++		err = pk.SubackDecode(payload)
++	case packets.Puback:
++		err = pk.PubackDecode(payload)
++	case packets.Pingresp:
++		// no payload
++	default:
++		return pk, nil
++	}
++	return pk, err
++}
++
++func readFrame(t *testing.T, fr *frameReader) packets.Packet {
++	t.Helper()
++	pk, err := fr.next()
++	require.NoError(t, err)
++	return pk
++}
++
++type frameResult struct{ pk packets.Packet }
++
++func drainFrames(w net.Conn) <-chan frameResult {
++	fr := newFrameReader(w)
++	ch := make(chan frameResult, 64)
++	go func() {
++		for {
++			pk, err := fr.next()
++			if err != nil {
++				close(ch)
++				return
++			}
++			ch <- frameResult{pk: pk}
++		}
++	}()
++	return ch
++}
++
++// --- harness ---
++
++func newEnhancedServer(t *testing.T, hook *scriptedEnhancedAuthHook) *Server {
++	s := newServer()
++	require.NoError(t, s.AddHook(hook, nil))
++	t.Cleanup(func() { _ = s.Close() })
++	return s
++}
++
++func dialServer(t *testing.T, s *Server) (net.Conn, chan error) {
++	r, w := net.Pipe()
++	done := make(chan error, 1)
++	go func() { done <- s.EstablishConnection("tcp", r) }()
++	return w, done
++}
++
++func waitEstablish(t *testing.T, done <-chan error) error {
++	t.Helper()
++	select {
++	case err := <-done:
++		return err
++	case <-time.After(5 * time.Second):
++		t.Fatal("EstablishConnection did not return in time")
++		return nil
++	}
++}
++
++func writePacket(t *testing.T, w net.Conn, pk packets.Packet) {
++	t.Helper()
++	_, err := w.Write(mustEncodePacket(t, pk))
++	require.NoError(t, err)
++}
++
++// challengeOnConnect is the standard two-round script: CONNECT -> AUTH 0x18,
++// client AUTH 0x18 -> AUTH 0x00.
++func challengeOnConnect(cl *Client, pk packets.Packet, call int) (packets.Packet, error) {
++	if call == 0 {
++		return v5Auth(packets.CodeContinueAuthentication.Code, testAuthMethod, []byte("server-challenge")), nil
++	}
++	return v5Auth(packets.CodeSuccess.Code, testAuthMethod, []byte("server-final")), nil
++}
++
++// --- AC-1: multi-round handshake succeeds, then business packets flow ---
++
++func TestEnhancedAuthTwoRoundHandshake(t *testing.T) {
++	hook := &scriptedEnhancedAuthHook{fn: challengeOnConnect}
++	s := newEnhancedServer(t, hook)
++
++	w, done := dialServer(t, s)
++	defer w.Close()
++	fr := newFrameReader(w)
++
++	writePacket(t, w, v5Connect("ea-two-round", testAuthMethod, []byte("client-first"), false))
++
++	a1 := readFrame(t, fr)
++	require.Equal(t, packets.Auth, a1.FixedHeader.Type)
++	require.Equal(t, packets.CodeContinueAuthentication.Code, a1.ReasonCode)
++	require.Equal(t, testAuthMethod, a1.Properties.AuthenticationMethod)
++	require.Equal(t, []byte("server-challenge"), a1.Properties.AuthenticationData)
++
++	writePacket(t, w, v5Auth(packets.CodeContinueAuthentication.Code, testAuthMethod, []byte("client-final")))
++
++	a2 := readFrame(t, fr)
++	require.Equal(t, packets.Auth, a2.FixedHeader.Type)
++	require.Equal(t, packets.CodeSuccess.Code, a2.ReasonCode)
++	require.Equal(t, []byte("server-final"), a2.Properties.AuthenticationData)
++
++	ca := readFrame(t, fr)
++	require.Equal(t, packets.Connack, ca.FixedHeader.Type)
++	require.Equal(t, packets.CodeSuccess.Code, ca.ReasonCode)
++	require.False(t, ca.SessionPresent)
++	require.Equal(t, testAuthMethod, ca.Properties.AuthenticationMethod)
++
++	// business packets are allowed only after CONNACK
++	writePacket(t, w, v5Subscribe(1, "a/b/c"))
++	sb := readFrame(t, fr)
++	require.Equal(t, packets.Suback, sb.FixedHeader.Type)
++	require.Equal(t, []byte{packets.CodeSuccess.Code}, sb.ReasonCodes)
++
++	cl, ok := s.Clients.Get("ea-two-round")
++	require.True(t, ok)
++	require.Equal(t, AuthStateAuthenticated, cl.AuthState())
++	require.Equal(t, 1, len(cl.State.Subscriptions.GetAll()))
++
++	// clean disconnect ends the connection
++	writePacket(t, w, v5Disconnect(packets.CodeDisconnect.Code))
++	require.NoError(t, waitEstablish(t, done))
++
++	states, types, establishing, established, disconnects := hook.snapshot()
++	require.Equal(t, []byte{packets.Connect, packets.Auth}, types)
++	require.Equal(t, []AuthState{AuthStatePending, AuthStateAuthenticated}, states)
++	require.Equal(t, 1, establishing)
++	require.Equal(t, 1, established)
++	require.Equal(t, 1, disconnects, "clean disconnect after a completed handshake fires OnDisconnect")
++	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.EnhancedAuthSucceeded))
++	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.EnhancedAuthPending))
++	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.EnhancedAuthFailed))
++}
++
++// --- AC-2: immediate success variants establish the session exactly once ---
++
++func TestEnhancedAuthImmediateSuccess(t *testing.T) {
++	tests := []struct {
++		name     string
++		resp     packets.Packet
++		wantAuth bool
++	}{
++		{name: "zero packet, no auth frame", resp: packets.Packet{}, wantAuth: false},
++		{name: "auth success frame", resp: v5Auth(packets.CodeSuccess.Code, testAuthMethod, []byte("final")), wantAuth: true},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			hook := &scriptedEnhancedAuthHook{fn: func(cl *Client, pk packets.Packet, call int) (packets.Packet, error) {
++				return tc.resp, nil
++			}}
++			s := newEnhancedServer(t, hook)
++
++			w, done := dialServer(t, s)
++			defer w.Close()
++			fr := newFrameReader(w)
++
++			writePacket(t, w, v5Connect("ea-immediate", testAuthMethod, nil, false))
++
++			if tc.wantAuth {
++				a := readFrame(t, fr)
++				require.Equal(t, packets.Auth, a.FixedHeader.Type)
++				require.Equal(t, packets.CodeSuccess.Code, a.ReasonCode)
++			}
++			ca := readFrame(t, fr)
++			require.Equal(t, packets.Connack, ca.FixedHeader.Type)
++			require.Equal(t, packets.CodeSuccess.Code, ca.ReasonCode)
++
++			writePacket(t, w, v5Disconnect(packets.CodeDisconnect.Code))
++			require.NoError(t, waitEstablish(t, done))
++
++			states, types, establishing, established, disconnects := hook.snapshot()
++			require.Equal(t, []byte{packets.Connect}, types) // no AUTH packets
++			require.Equal(t, []AuthState{AuthStatePending, AuthStateAuthenticated}, states)
++			require.Equal(t, 1, establishing)
++			require.Equal(t, 1, established)
++			require.Equal(t, 1, disconnects)
++		})
++	}
++}
++
++// --- AC-3: business packets during the handshake are rejected deterministically ---
++
++func TestEnhancedAuthBusinessPacketDuringHandshake(t *testing.T) {
++	offending := []struct {
++		name string
++		pk   packets.Packet
++	}{
++		{"publish", v5PublishQos0("a/b/c", []byte("x"))},
++		{"subscribe", v5Subscribe(1, "a/b/c")},
++		{"pingreq", v5Pingreq()},
++	}
++	for _, tc := range offending {
++		t.Run(tc.name, func(t *testing.T) {
++			hook := &scriptedEnhancedAuthHook{fn: challengeOnConnect}
++			s := newEnhancedServer(t, hook)
++
++			w, done := dialServer(t, s)
++			defer w.Close()
++			fr := newFrameReader(w)
++
++			writePacket(t, w, v5Connect("ea-gate-"+tc.name, testAuthMethod, nil, false))
++			challenge := readFrame(t, fr)
++			require.Equal(t, packets.CodeContinueAuthentication.Code, challenge.ReasonCode)
++
++			writePacket(t, w, tc.pk)
++
++			d := readFrame(t, fr)
++			require.Equal(t, packets.Disconnect, d.FixedHeader.Type)
++			require.Equal(t, packets.ErrProtocolViolation.Code, d.ReasonCode) // 0x82
++
++			require.Error(t, waitEstablish(t, done))
++
++			// no business side effects
++			require.Equal(t, 0, s.Clients.Len())
++			require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Subscriptions))
++			_, types, establishing, established, disconnects := hook.snapshot()
++			require.Equal(t, []byte{packets.Connect}, types) // hook never saw the offending packet as AUTH
++			require.Equal(t, 0, establishing)
++			require.Equal(t, 0, established)
++			require.Equal(t, 1, disconnects, "rejected handshake fires OnDisconnect")
++		})
++	}
++}
++
++// --- AC-4: method mismatch -> 0x8C; missing method -> 0x82 ---
++
++func TestEnhancedAuthMethodViolations(t *testing.T) {
++	tests := []struct {
++		name       string
++		auth       packets.Packet
++		wantReason byte
++	}{
++		{"different method", v5Auth(packets.CodeContinueAuthentication.Code, "OTHER-METHOD", nil), packets.ErrBadAuthenticationMethod.Code},
++		{"missing method", v5Auth(packets.CodeContinueAuthentication.Code, "", nil), packets.ErrProtocolViolation.Code},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			hook := &scriptedEnhancedAuthHook{fn: challengeOnConnect}
++			s := newEnhancedServer(t, hook)
++
++			w, done := dialServer(t, s)
++			defer w.Close()
++			fr := newFrameReader(w)
++
++			writePacket(t, w, v5Connect("ea-method-"+tc.name, testAuthMethod, nil, false))
++			_ = readFrame(t, fr) // challenge
++
++			writePacket(t, w, tc.auth)
++
++			d := readFrame(t, fr)
++			require.Equal(t, packets.Disconnect, d.FixedHeader.Type)
++			require.Equal(t, tc.wantReason, d.ReasonCode)
++			require.Error(t, waitEstablish(t, done))
++		})
++	}
++}
++
++// --- AC-5: client reason codes out of the handshake phase ---
++
++func TestEnhancedAuthIllegalReasonDuringHandshake(t *testing.T) {
++	tests := []struct {
++		name string
++		rc   byte
++	}{
++		{"reauth code during handshake", packets.CodeReAuthenticate.Code}, // 0x19
++		{"success code from client", packets.CodeSuccess.Code},            // 0x00 is server->client only
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			hook := &scriptedEnhancedAuthHook{fn: challengeOnConnect}
++			s := newEnhancedServer(t, hook)
++
++			w, done := dialServer(t, s)
++			defer w.Close()
++			fr := newFrameReader(w)
++
++			writePacket(t, w, v5Connect("ea-rc-"+tc.name, testAuthMethod, nil, false))
++			_ = readFrame(t, fr)
++
++			writePacket(t, w, v5Auth(tc.rc, testAuthMethod, nil))
++
++			d := readFrame(t, fr)
++			require.Equal(t, packets.Disconnect, d.FixedHeader.Type)
++			require.Equal(t, packets.ErrProtocolViolation.Code, d.ReasonCode)
++			require.Error(t, waitEstablish(t, done))
++		})
++	}
++}
++
++// --- AC-6: hook denial at the CONNECT stage is signalled with CONNACK ---
++
++func TestEnhancedAuthConnectHookDenies(t *testing.T) {
++	tests := []struct {
++		name string
++		code packets.Code
++	}{
++		{"not authorized", packets.ErrNotAuthorized},                      // 0x87
++		{"bad authentication method", packets.ErrBadAuthenticationMethod}, // 0x8C
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			hook := &scriptedEnhancedAuthHook{fn: func(cl *Client, pk packets.Packet, call int) (packets.Packet, error) {
++				return packets.Packet{}, tc.code
++			}}
++			s := newEnhancedServer(t, hook)
++
++			w, done := dialServer(t, s)
++			defer w.Close()
++			fr := newFrameReader(w)
++
++			writePacket(t, w, v5Connect("ea-deny-"+tc.name, testAuthMethod, nil, false))
++
++			ca := readFrame(t, fr)
++			require.Equal(t, packets.Connack, ca.FixedHeader.Type)
++			require.Equal(t, tc.code.Code, ca.ReasonCode)
++
++			err := waitEstablish(t, done)
++			require.Error(t, err)
++
++			require.Equal(t, 0, s.Clients.Len())
++			require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.EnhancedAuthSucceeded))
++			require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.EnhancedAuthFailed))
++			states, _, establishing, _, disconnects := hook.snapshot()
++			require.Equal(t, []AuthState{AuthStatePending, AuthStateFailed}, states)
++			require.Equal(t, 0, establishing)
++			require.Equal(t, 1, disconnects, "CONNECT-stage refusal fires OnDisconnect")
++		})
++	}
++}
++
++// --- AC-7: challenge write failure terminates deterministically ---
++
++func TestEnhancedAuthChallengeWriteFailure(t *testing.T) {
++	hook := &scriptedEnhancedAuthHook{fn: challengeOnConnect}
++	s := newEnhancedServer(t, hook)
++
++	w, done := dialServer(t, s)
++
++	// write CONNECT and close the client side before the broker can deliver
++	// the challenge.
++	_, err := w.Write(mustEncodePacket(t, v5Connect("ea-writefail", testAuthMethod, nil, false)))
++	require.NoError(t, err)
++	require.NoError(t, w.Close())
++
++	require.Error(t, waitEstablish(t, done))
++	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.EnhancedAuthPending))
++	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.EnhancedAuthFailed))
++	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.EnhancedAuthSucceeded))
++}
++
++// --- AC-8: re-authentication succeeds without touching the session ---
++
++func TestReAuthSuccessSessionIntact(t *testing.T) {
++	call := atomic.Int32{}
++	hook := &scriptedEnhancedAuthHook{fn: func(cl *Client, pk packets.Packet, c int) (packets.Packet, error) {
++		switch pk.FixedHeader.Type {
++		case packets.Connect:
++			return packets.Packet{}, nil // immediate success
++		case packets.Auth:
++			n := call.Add(1)
++			if n == 1 {
++				return v5Auth(packets.CodeContinueAuthentication.Code, testAuthMethod, []byte("reauth-challenge")), nil
++			}
++			return v5Auth(packets.CodeSuccess.Code, testAuthMethod, []byte("reauth-final")), nil
++		}
++		return packets.Packet{}, nil
++	}}
++	s := newEnhancedServer(t, hook)
++
++	w, done := dialServer(t, s)
++	defer w.Close()
++	fr := newFrameReader(w)
++
++	writePacket(t, w, v5Connect("ea-reauth", testAuthMethod, nil, false))
++	require.Equal(t, packets.CodeSuccess.Code, readFrame(t, fr).ReasonCode)
++
++	writePacket(t, w, v5Subscribe(1, "a/b"))
++	require.Equal(t, packets.Suback, readFrame(t, fr).FixedHeader.Type)
++
++	cl, ok := s.Clients.Get("ea-reauth")
++	require.True(t, ok)
++	require.Equal(t, 1, len(cl.State.Subscriptions.GetAll()))
++
++	// seed an in-flight QoS message to prove re-authentication must not touch
++	// inflight delivery state either
++	inflightBefore := *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet
++	inflightBefore.PacketID = 42
++	cl.State.Inflight.Set(inflightBefore)
++	require.Equal(t, 1, cl.State.Inflight.Len())
++
++	// client initiates re-authentication
++	writePacket(t, w, v5Auth(packets.CodeReAuthenticate.Code, testAuthMethod, []byte("reauth-start")))
++	challenge := readFrame(t, fr)
++	require.Equal(t, packets.Auth, challenge.FixedHeader.Type)
++	require.Equal(t, packets.CodeContinueAuthentication.Code, challenge.ReasonCode)
++
++	// business packets keep flowing while re-authentication is in progress
++	writePacket(t, w, v5Pingreq())
++	pong := readFrame(t, fr)
++	require.Equal(t, packets.Pingresp, pong.FixedHeader.Type)
++
++	// client completes the exchange
++	writePacket(t, w, v5Auth(packets.CodeContinueAuthentication.Code, testAuthMethod, []byte("reauth-response")))
++	final := readFrame(t, fr)
++	require.Equal(t, packets.Auth, final.FixedHeader.Type)
++	require.Equal(t, packets.CodeSuccess.Code, final.ReasonCode)
++
++	// session untouched: subscriptions AND the in-flight message survive re-auth
++	require.Equal(t, AuthStateAuthenticated, cl.AuthState())
++	require.Equal(t, 1, len(cl.State.Subscriptions.GetAll()))
++	require.Equal(t, 1, cl.State.Inflight.Len(), "inflight messages must survive re-authentication")
++	_, stillInflight := cl.State.Inflight.Get(42)
++	require.True(t, stillInflight)
++
++	writePacket(t, w, v5Disconnect(packets.CodeDisconnect.Code))
++	require.NoError(t, waitEstablish(t, done))
++
++	states, _, establishing, established, disconnects := hook.snapshot()
++	require.Equal(t, []AuthState{
++		AuthStatePending,
++		AuthStateAuthenticated,
++		AuthStateReAuthenticating,
++		AuthStateAuthenticated,
++	}, states)
++	require.Equal(t, 1, establishing) // session established only for the initial connect
++	require.Equal(t, 1, established)
++	require.Equal(t, 1, disconnects)
++	require.Equal(t, int64(2), atomic.LoadInt64(&s.Info.EnhancedAuthSucceeded))
++	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.EnhancedAuthPending))
++}
++
++// --- AC-9: re-authentication failure disconnects but keeps the persistent session ---
++
++func TestReAuthFailurePreservesPersistentSession(t *testing.T) {
++	hook := &scriptedEnhancedAuthHook{fn: func(cl *Client, pk packets.Packet, call int) (packets.Packet, error) {
++		switch pk.FixedHeader.Type {
++		case packets.Connect:
++			return packets.Packet{}, nil // immediate success
++		case packets.Auth:
++			return packets.Packet{}, packets.ErrNotAuthorized // re-authentication fails
++		}
++		return packets.Packet{}, nil
++	}}
++	s := newEnhancedServer(t, hook)
++
++	// first connection: enhanced auth, persistent, subscribed
++	w1, done1 := dialServer(t, s)
++	fr1 := newFrameReader(w1)
++	writePacket(t, w1, v5Connect("ea-reauth-fail", testAuthMethod, nil, true))
++	require.Equal(t, packets.CodeSuccess.Code, readFrame(t, fr1).ReasonCode)
++	writePacket(t, w1, v5Subscribe(1, "p/ersist"))
++	require.Equal(t, packets.Suback, readFrame(t, fr1).FixedHeader.Type)
++
++	// re-authentication starts and fails
++	writePacket(t, w1, v5Auth(packets.CodeReAuthenticate.Code, testAuthMethod, nil))
++	d := readFrame(t, fr1)
++	require.Equal(t, packets.Disconnect, d.FixedHeader.Type)
++	require.Equal(t, packets.ErrNotAuthorized.Code, d.ReasonCode)
++	require.Error(t, waitEstablish(t, done1))
++	require.NoError(t, w1.Close())
++
++	// persistent session remains registered with its subscriptions
++	old, ok := s.Clients.Get("ea-reauth-fail")
++	require.True(t, ok)
++	require.Equal(t, 1, len(old.State.Subscriptions.GetAll()))
++	require.Equal(t, AuthStateFailed, old.AuthState())
++
++	// reconnect with the same client id and authenticate successfully
++	w2, done2 := dialServer(t, s)
++	defer w2.Close()
++	fr2 := newFrameReader(w2)
++	writePacket(t, w2, v5Connect("ea-reauth-fail", testAuthMethod, nil, true))
++	ca := readFrame(t, fr2)
++	require.Equal(t, packets.Connack, ca.FixedHeader.Type)
++	require.Equal(t, packets.CodeSuccess.Code, ca.ReasonCode)
++	require.True(t, ca.SessionPresent, "persistent session must resume after re-auth failure")
++
++	newCl, ok := s.Clients.Get("ea-reauth-fail")
++	require.True(t, ok)
++	require.Equal(t, AuthStateAuthenticated, newCl.AuthState())
++	require.Equal(t, 1, len(newCl.State.Subscriptions.GetAll()), "subscriptions inherited")
++
++	writePacket(t, w2, v5Disconnect(packets.CodeDisconnect.Code))
++	require.NoError(t, waitEstablish(t, done2))
++}
++
++// --- AC-10: illegal AUTH packets in invalid phases ---
++
++func TestEnhancedAuthIllegalAuthPlainV5(t *testing.T) {
++	// plain v5 connection (no Authentication Method, legacy path): any AUTH is
++	// a protocol violation.
++	s := newServer()
++	t.Cleanup(func() { _ = s.Close() })
++
++	w, done := dialServer(t, s)
++	defer w.Close()
++	fr := newFrameReader(w)
++
++	// persistent so the client record survives the disconnect and can be inspected
++	writePacket(t, w, v5ConnectPlain("plain-v5", true))
++	require.Equal(t, packets.CodeSuccess.Code, readFrame(t, fr).ReasonCode)
++
++	writePacket(t, w, v5Auth(packets.CodeContinueAuthentication.Code, testAuthMethod, nil))
++	d := readFrame(t, fr)
++	require.Equal(t, packets.Disconnect, d.FixedHeader.Type)
++	require.Equal(t, packets.ErrProtocolViolation.Code, d.ReasonCode)
++	require.Error(t, waitEstablish(t, done))
++
++	cl, ok := s.Clients.Get("plain-v5")
++	require.True(t, ok)
++	require.Equal(t, AuthStateNone, cl.AuthState(), "plain connection never enters enhanced auth")
++}
++
++func TestEnhancedAuthV3AuthPacketRejected(t *testing.T) {
++	// MQTT v3.1.1 has no AUTH packet: packet type 15 is reserved and the
++	// broker must close the connection.
++	s := newServer()
++	t.Cleanup(func() { _ = s.Close() })
++
++	r, w := net.Pipe()
++	done := make(chan error, 1)
++	go func() { done <- s.EstablishConnection("tcp", r) }()
++	defer w.Close()
++
++	_, err := w.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectMqtt311).RawBytes)
++	require.NoError(t, err)
++
++	// a v3 CONNACK is exactly 4 bytes with no properties block
++	connack := make([]byte, 4)
++	_, err = io.ReadFull(w, connack)
++	require.NoError(t, err)
++	require.Equal(t, []byte{packets.Connack << 4, 0x02, 0x00, 0x00}, connack)
++
++	// send packet type 15 (AUTH in v5, reserved in v3)
++	_, err = w.Write([]byte{packets.Auth << 4, 0x00})
++	require.NoError(t, err)
++
++	// the broker terminates the connection deterministically
++	require.Error(t, waitEstablish(t, done))
++}
++
++func TestReAuthDuplicateStartAndBareContinue(t *testing.T) {
++	hook := &scriptedEnhancedAuthHook{fn: func(cl *Client, pk packets.Packet, call int) (packets.Packet, error) {
++		switch pk.FixedHeader.Type {
++		case packets.Connect:
++			return packets.Packet{}, nil
++		case packets.Auth:
++			return v5Auth(packets.CodeContinueAuthentication.Code, testAuthMethod, []byte("challenge")), nil
++		}
++		return packets.Packet{}, nil
++	}}
++	s := newEnhancedServer(t, hook)
++
++	t.Run("duplicate re-authentication start", func(t *testing.T) {
++		w, done := dialServer(t, s)
++		defer w.Close()
++		fr := newFrameReader(w)
++
++		writePacket(t, w, v5Connect("ea-dup-reauth", testAuthMethod, nil, false))
++		_ = readFrame(t, fr)
++
++		writePacket(t, w, v5Auth(packets.CodeReAuthenticate.Code, testAuthMethod, nil))
++		require.Equal(t, packets.CodeContinueAuthentication.Code, readFrame(t, fr).ReasonCode)
++
++		// a second 0x19 while the exchange is already in progress
++		writePacket(t, w, v5Auth(packets.CodeReAuthenticate.Code, testAuthMethod, nil))
++		d := readFrame(t, fr)
++		require.Equal(t, packets.Disconnect, d.FixedHeader.Type)
++		require.Equal(t, packets.ErrProtocolViolation.Code, d.ReasonCode)
++		require.Error(t, waitEstablish(t, done))
++	})
++
++	t.Run("bare continue without re-auth start", func(t *testing.T) {
++		w, done := dialServer(t, s)
++		defer w.Close()
++		fr := newFrameReader(w)
++
++		writePacket(t, w, v5Connect("ea-bare-cont", testAuthMethod, nil, false))
++		_ = readFrame(t, fr)
++
++		// 0x18 without a preceding 0x19
++		writePacket(t, w, v5Auth(packets.CodeContinueAuthentication.Code, testAuthMethod, nil))
++		d := readFrame(t, fr)
++		require.Equal(t, packets.Disconnect, d.FixedHeader.Type)
++		require.Equal(t, packets.ErrProtocolViolation.Code, d.ReasonCode)
++		require.Error(t, waitEstablish(t, done))
++	})
++}
++
++// --- AC-11: unauthenticated connections must not take over existing sessions ---
++
++func TestEnhancedAuthNoTakeoverBeforeAuthenticated(t *testing.T) {
++	connects := atomic.Int32{}
++	hook := &scriptedEnhancedAuthHook{fn: func(cl *Client, pk packets.Packet, call int) (packets.Packet, error) {
++		if pk.FixedHeader.Type == packets.Connect && connects.Add(1) == 2 {
++			// the takeover attempt issues a challenge but never completes
++			return v5Auth(packets.CodeContinueAuthentication.Code, testAuthMethod, []byte("challenge")), nil
++		}
++		return packets.Packet{}, nil // all other connects authenticate immediately
++	}}
++	s := newEnhancedServer(t, hook)
++
++	// original connection: persistent, subscribed
++	w1, done1 := dialServer(t, s)
++	frames1 := drainFrames(w1)
++	writePacket(t, w1, v5Connect("takeover-ea", testAuthMethod, nil, true))
++	require.Equal(t, packets.Connack, (<-frames1).pk.FixedHeader.Type)
++	writePacket(t, w1, v5Subscribe(1, "t/o"))
++	require.Equal(t, packets.Suback, (<-frames1).pk.FixedHeader.Type)
++
++	old, ok := s.Clients.Get("takeover-ea")
++	require.True(t, ok)
++	oldSubs := len(old.State.Subscriptions.GetAll())
++	require.Equal(t, 1, oldSubs)
++
++	// second connection: same client id, enhanced auth is abandoned mid-handshake
++	w2, done2 := dialServer(t, s)
++	fr2 := newFrameReader(w2)
++	writePacket(t, w2, v5Connect("takeover-ea", testAuthMethod, nil, true))
++	challenge, err := fr2.next()
++	require.NoError(t, err)
++	require.Equal(t, packets.CodeContinueAuthentication.Code, challenge.ReasonCode)
++	require.NoError(t, w2.Close())
++	require.Error(t, waitEstablish(t, done2))
++
++	// original connection must survive the unauthenticated attempt
++	require.False(t, old.Closed(), "existing client must not be taken over before auth success")
++	require.Nil(t, old.StopCause())
++	require.Equal(t, oldSubs, len(old.State.Subscriptions.GetAll()))
++	require.Equal(t, old, mustGetClient(s, "takeover-ea"))
++
++	// third connection: authenticates successfully -> single takeover
++	w3, done3 := dialServer(t, s)
++	fr3 := newFrameReader(w3)
++	writePacket(t, w3, v5Connect("takeover-ea", testAuthMethod, nil, true))
++	ca, err := fr3.next()
++	require.NoError(t, err)
++	require.Equal(t, packets.Connack, ca.FixedHeader.Type)
++	require.True(t, ca.SessionPresent)
++
++	// old connection received the takeover DISCONNECT
++selectFrames:
++	for {
++		select {
++		case f, ok := <-frames1:
++			if !ok {
++				t.Fatal("expected takeover DISCONNECT on old connection")
++			}
++			if f.pk.FixedHeader.Type == packets.Disconnect {
++				require.Equal(t, packets.ErrSessionTakenOver.Code, f.pk.ReasonCode)
++				break selectFrames
++			}
++		case <-time.After(5 * time.Second):
++			t.Fatal("timed out waiting for takeover DISCONNECT")
++		}
++	}
++	require.Error(t, waitEstablish(t, done1))
++	require.ErrorIs(t, old.StopCause(), packets.ErrSessionTakenOver)
++
++	newCl := mustGetClient(s, "takeover-ea")
++	require.NotSame(t, old, newCl)
++	require.Equal(t, AuthStateAuthenticated, newCl.AuthState())
++	require.Equal(t, 1, len(newCl.State.Subscriptions.GetAll()), "subscriptions inherited after authenticated takeover")
++
++	writePacket(t, w3, v5Disconnect(packets.CodeDisconnect.Code))
++	require.NoError(t, waitEstablish(t, done3))
++	require.NoError(t, w1.Close())
++}
++
++func mustGetClient(s *Server, id string) *Client {
++	cl, ok := s.Clients.Get(id)
++	if !ok {
++		return nil
++	}
++	return cl
++}
++
++// --- AC-12: CONNECT with method but no OnAuthPacket hook keeps legacy path ---
++
++func TestEnhancedAuthLegacyFallbackWithoutHook(t *testing.T) {
++	s := newServer() // only AllowHook (OnConnectAuthenticate/OnACLCheck), no OnAuthPacket
++	t.Cleanup(func() { _ = s.Close() })
++
++	w, done := dialServer(t, s)
++	defer w.Close()
++	fr := newFrameReader(w)
++
++	writePacket(t, w, v5Connect("legacy-method", "SHA-1", []byte("auth-data"), false))
++	ca := readFrame(t, fr)
++	require.Equal(t, packets.Connack, ca.FixedHeader.Type)
++	require.Equal(t, packets.CodeSuccess.Code, ca.ReasonCode)
++	require.Equal(t, "SHA-1", ca.Properties.AuthenticationMethod, "legacy CONNACK echoes the method")
++
++	cl, ok := s.Clients.Get("legacy-method")
++	require.True(t, ok)
++	require.Equal(t, AuthStateNone, cl.AuthState(), "legacy connection is not in enhanced auth")
++
++	writePacket(t, w, v5Disconnect(packets.CodeDisconnect.Code))
++	require.NoError(t, waitEstablish(t, done))
++}
++
++// --- AC-14: handshake abandoned by the client reconciles counters/state ---
++
++func TestEnhancedAuthAbandonedHandshakeReconciles(t *testing.T) {
++	hook := &scriptedEnhancedAuthHook{fn: challengeOnConnect}
++	s := newEnhancedServer(t, hook)
++
++	w, done := dialServer(t, s)
++	fr := newFrameReader(w)
++	writePacket(t, w, v5Connect("ea-abandon", testAuthMethod, nil, false))
++	_ = readFrame(t, fr)
++
++	// client vanishes mid-handshake without DISCONNECT
++	require.NoError(t, w.Close())
++	require.Error(t, waitEstablish(t, done))
++
++	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.EnhancedAuthPending))
++	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.EnhancedAuthFailed))
++	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.EnhancedAuthSucceeded))
++	states, _, establishing, _, disconnects := hook.snapshot()
++	require.Equal(t, []AuthState{AuthStatePending, AuthStateFailed}, states)
++	require.Equal(t, 0, establishing)
++	require.Equal(t, 1, disconnects, "interrupted handshake fires OnDisconnect")
++}
++
++// --- AC-3/AC-14: explicit DISCONNECT while pending aborts the handshake (non-success) ---
++
++func TestEnhancedAuthExplicitDisconnectDuringHandshake(t *testing.T) {
++	hook := &scriptedEnhancedAuthHook{fn: challengeOnConnect}
++	s := newEnhancedServer(t, hook)
++
++	w, done := dialServer(t, s)
++	defer w.Close()
++	fr := newFrameReader(w)
++
++	writePacket(t, w, v5Connect("ea-abort-disc", testAuthMethod, nil, false))
++	require.Equal(t, packets.CodeContinueAuthentication.Code, readFrame(t, fr).ReasonCode)
++
++	// the client cleanly abandons the exchange with DISCONNECT (reason 0x00)
++	writePacket(t, w, v5Disconnect(packets.CodeDisconnect.Code))
++
++	// EstablishConnection must NOT return nil-success: no CONNACK/session and
++	// the aborted exchange is counted as a failure.
++	require.Error(t, waitEstablish(t, done))
++	require.Equal(t, 0, s.Clients.Len(), "no session is established for an aborted handshake")
++	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.EnhancedAuthPending))
++	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.EnhancedAuthFailed))
++	states, _, establishing, established, disconnects := hook.snapshot()
++	require.Equal(t, 0, establishing)
++	require.Equal(t, 0, established)
++	require.Equal(t, 1, disconnects, "abandoned handshake fires OnDisconnect")
++	require.Equal(t, AuthStateFailed, states[len(states)-1])
++}
++
++// --- AC-13: $SYS topics publish enhanced auth counters ---
++
++func TestEnhancedAuthSYSTopics(t *testing.T) {
++	hook := &scriptedEnhancedAuthHook{fn: func(cl *Client, pk packets.Packet, call int) (packets.Packet, error) {
++		return packets.Packet{}, packets.ErrBadAuthenticationMethod
++	}}
++	s := newEnhancedServer(t, hook)
++
++	w, done := dialServer(t, s)
++	fr := newFrameReader(w)
++	writePacket(t, w, v5Connect("ea-sys", testAuthMethod, nil, false))
++	ca := readFrame(t, fr)
++	require.Equal(t, packets.ErrBadAuthenticationMethod.Code, ca.ReasonCode)
++	_ = waitEstablish(t, done)
++	_ = w.Close()
++
++	s.publishSysTopics()
++
++	msgs := s.Topics.Messages(SysPrefix + "/broker/auth/enhanced/failed")
++	require.Len(t, msgs, 1)
++	require.Equal(t, "1", string(msgs[0].Payload))
++
++	msgs = s.Topics.Messages(SysPrefix + "/broker/auth/enhanced/succeeded")
++	require.Len(t, msgs, 1)
++	require.Equal(t, "0", string(msgs[0].Payload))
++}
+diff --git a/mqtt/clients.go b/mqtt/clients.go
+index b47b68a..0536372 100644
+--- a/mqtt/clients.go
++++ b/mqtt/clients.go
+@@ -33,6 +33,46 @@ const (
+ 	InheritWayRemote
+ )
+ 
++// AuthState tracks the MQTT v5 enhanced authentication state of a client
++// as part of the connection lifecycle (MQTT v5.0 §4.12 Enhanced Authentication).
++type AuthState uint32
++
++const (
++	// AuthStateNone means no enhanced authentication is in use for the connection
++	// (plain MQTT v5 without Authentication Method, or MQTT v3).
++	AuthStateNone AuthState = iota
++	// AuthStatePending means the initial enhanced authentication handshake is in
++	// progress (CONNECT with Authentication Method received, CONNACK not yet sent).
++	// Only AUTH and DISCONNECT packets are legal in this state.
++	AuthStatePending
++	// AuthStateReAuthenticating means a re-authentication exchange (AUTH 0x19)
++	// is in progress on an otherwise fully established session.
++	AuthStateReAuthenticating
++	// AuthStateAuthenticated means enhanced authentication completed successfully;
++	// normal business packets are allowed.
++	AuthStateAuthenticated
++	// AuthStateFailed is the terminal state after an authentication failure or
++	// protocol violation during an enhanced authentication exchange.
++	AuthStateFailed
++)
++
++// String returns the human readable name of the authentication state, used by
++// logs, hooks and the management/observation plane.
++func (s AuthState) String() string {
++	switch s {
++	case AuthStatePending:
++		return "pending"
++	case AuthStateReAuthenticating:
++		return "reauthenticating"
++	case AuthStateAuthenticated:
++		return "authenticated"
++	case AuthStateFailed:
++		return "failed"
++	default:
++		return "none"
++	}
++}
++
+ // ReadFn is the function signature for the function used for reading and processing new packets.
+ type ReadFn func(*Client, packets.Packet) error
+ 
+@@ -121,6 +161,40 @@ type Client struct {
+ func (cl *Client) BytesRecv() int64 { return cl.bytesRecv.Load() }
+ func (cl *Client) BytesSent() int64 { return cl.bytesSent.Load() }
+ 
++// AuthState returns the current MQTT v5 enhanced authentication state of the
++// connection (none/pending/reauthenticating/authenticated/failed).
++func (cl *Client) AuthState() AuthState {
++	return AuthState(cl.State.authState.Load())
++}
++
++// AuthenticationMethod returns the Authentication Method declared by the client
++// in CONNECT when enhanced authentication is used; empty for plain connections.
++func (cl *Client) AuthenticationMethod() string {
++	cl.RLock()
++	defer cl.RUnlock()
++	return cl.State.authMethod
++}
++
++// setAuthMethod records the Authentication Method of the enhanced authentication
++// exchange. It is written once per connection, on the connection packet goroutine.
++func (cl *Client) setAuthMethod(method string) {
++	cl.Lock()
++	defer cl.Unlock()
++	cl.State.authMethod = method
++}
++
++// casAuthState atomically transitions the enhanced authentication state from
++// `from` to `to`. It returns false if the current state is not `from`, ensuring
++// duplicate or concurrent AUTH packets can never advance the state machine twice.
++func (cl *Client) casAuthState(from, to AuthState) bool {
++	return cl.State.authState.CompareAndSwap(uint32(from), uint32(to))
++}
++
++// storeAuthState unconditionally sets the enhanced authentication state.
++func (cl *Client) storeAuthState(to AuthState) {
++	cl.State.authState.Store(uint32(to))
++}
++
+ // ClientConnection contains the connection transport and metadata for the client.
+ type ClientConnection struct {
+ 	Conn     net.Conn          // the net.Conn used to establish the connection
+@@ -166,6 +240,8 @@ type ClientState struct {
+ 	outboundQty     int32                // number of messages currently in the outbound queue
+ 	Keepalive       uint16               // the number of seconds the connection can wait
+ 	ServerKeepalive bool                 // keepalive was set by the server
++	authState       atomic.Uint32        // MQTT v5 enhanced authentication state (AuthState), see §4.12
++	authMethod      string               // Authentication Method declared in CONNECT for enhanced auth
+ }
+ 
+ // newClient returns a new instance of Client. This is almost exclusively used by Server
+diff --git a/mqtt/clients_test.go b/mqtt/clients_test.go
+index 6e13e27..9e83036 100644
+--- a/mqtt/clients_test.go
++++ b/mqtt/clients_test.go
+@@ -57,6 +57,39 @@ func TestNewInflights(t *testing.T) {
+ 	require.NotNil(t, NewInflights().internal)
+ }
+ 
++func TestClientEnhancedAuthState(t *testing.T) {
++	cl, _, _ := newTestClient()
++
++	// fresh clients start outside the enhanced authentication lifecycle.
++	require.Equal(t, AuthStateNone, cl.AuthState())
++	require.Equal(t, "", cl.AuthenticationMethod())
++	require.Equal(t, "none", AuthStateNone.String())
++	require.Equal(t, "pending", AuthStatePending.String())
++	require.Equal(t, "reauthenticating", AuthStateReAuthenticating.String())
++	require.Equal(t, "authenticated", AuthStateAuthenticated.String())
++	require.Equal(t, "failed", AuthStateFailed.String())
++
++	cl.setAuthMethod("SCRAM-SHA-256")
++	require.Equal(t, "SCRAM-SHA-256", cl.AuthenticationMethod())
++
++	// legal forward transition succeeds.
++	require.True(t, cl.casAuthState(AuthStateNone, AuthStatePending))
++	require.Equal(t, AuthStatePending, cl.AuthState())
++	require.True(t, cl.casAuthState(AuthStatePending, AuthStateAuthenticated))
++	require.Equal(t, AuthStateAuthenticated, cl.AuthState())
++
++	// a duplicate/concurrent transition from the same source state can only
++	// win once (after the first win the state is no longer Pending), and a
++	// transition from a non-current state fails, so the session is never
++	// advanced twice.
++	require.False(t, cl.casAuthState(AuthStatePending, AuthStateAuthenticated))
++	require.False(t, cl.casAuthState(AuthStateReAuthenticating, AuthStateAuthenticated))
++	require.False(t, cl.casAuthState(AuthStatePending, AuthStateFailed))
++
++	cl.storeAuthState(AuthStateFailed)
++	require.Equal(t, AuthStateFailed, cl.AuthState())
++}
++
+ func TestNewClients(t *testing.T) {
+ 	cl := NewClients()
+ 	require.NotNil(t, cl.internal)
+diff --git a/mqtt/hooks.go b/mqtt/hooks.go
+index c4f09d6..fd5dd1e 100644
+--- a/mqtt/hooks.go
++++ b/mqtt/hooks.go
+@@ -28,6 +28,7 @@ const (
+ 	OnSessionEstablished
+ 	OnDisconnect
+ 	OnAuthPacket
++	OnAuthStateChange
+ 	OnPacketRead
+ 	OnPacketEncode
+ 	OnPacketSent
+@@ -85,10 +86,11 @@ type Hook interface {
+ 	OnSessionEstablished(cl *Client, pk packets.Packet)
+ 	OnDisconnect(cl *Client, err error, expire bool)
+ 	OnAuthPacket(cl *Client, pk packets.Packet) (packets.Packet, error)
+-	OnPacketRead(cl *Client, pk packets.Packet) (packets.Packet, error) // triggers when a new packet is received by a client, but before packet validation
+-	OnPacketEncode(cl *Client, pk packets.Packet) packets.Packet        // modify a packet before it is byte-encoded and written to the client
+-	OnPacketSent(cl *Client, pk packets.Packet, b []byte)               // triggers when packet bytes have been written to the client
+-	OnPacketProcessed(cl *Client, pk packets.Packet, err error)         // triggers after a packet from the client been processed (handled)
++	OnAuthStateChange(cl *Client, state AuthState, method string, reason packets.Code) // triggers when the MQTT v5 enhanced authentication state changes (pending/reauthenticating/authenticated/failed)
++	OnPacketRead(cl *Client, pk packets.Packet) (packets.Packet, error)                // triggers when a new packet is received by a client, but before packet validation
++	OnPacketEncode(cl *Client, pk packets.Packet) packets.Packet                       // modify a packet before it is byte-encoded and written to the client
++	OnPacketSent(cl *Client, pk packets.Packet, b []byte)                              // triggers when packet bytes have been written to the client
++	OnPacketProcessed(cl *Client, pk packets.Packet, err error)                        // triggers after a packet from the client been processed (handled)
+ 	OnSubscribe(cl *Client, pk packets.Packet) packets.Packet
+ 	OnSubscribed(cl *Client, pk packets.Packet, reasonCodes []byte, counts []int) // counts is an array of the number of subscribers for the same filter
+ 	OnSelectSubscribers(subs *Subscribers, pk packets.Packet) *Subscribers
+@@ -306,6 +308,17 @@ func (h *Hooks) OnAuthPacket(cl *Client, pk packets.Packet) (pkx packets.Packet,
+ 	return
+ }
+ 
++// OnAuthStateChange is called when the MQTT v5 enhanced authentication state of a
++// client changes (pending, reauthenticating, authenticated, failed). It is an
++// observational event: hooks do not participate in the challenge exchange here.
++func (h *Hooks) OnAuthStateChange(cl *Client, state AuthState, method string, reason packets.Code) {
++	for _, hook := range h.GetAll() {
++		if hook.Provides(OnAuthStateChange) {
++			hook.OnAuthStateChange(cl, state, method, reason)
++		}
++	}
++}
++
+ // OnPacketEncode is called immediately before a packet is encoded to be sent to a client.
+ func (h *Hooks) OnPacketEncode(cl *Client, pk packets.Packet) packets.Packet {
+ 	for _, hook := range h.GetAll() {
+@@ -843,6 +856,10 @@ func (h *HookBase) OnAuthPacket(cl *Client, pk packets.Packet) (packets.Packet,
+ 	return pk, nil
+ }
+ 
++// OnAuthStateChange is called when the enhanced authentication state changes.
++func (h *HookBase) OnAuthStateChange(cl *Client, state AuthState, method string, reason packets.Code) {
++}
++
+ // OnPacketRead is called when a packet is received.
+ func (h *HookBase) OnPacketRead(cl *Client, pk packets.Packet) (packets.Packet, error) {
+ 	return pk, nil
+diff --git a/mqtt/hooks/storage/storage_test.go b/mqtt/hooks/storage/storage_test.go
+index 1cdc346..99f89d6 100644
+--- a/mqtt/hooks/storage/storage_test.go
++++ b/mqtt/hooks/storage/storage_test.go
+@@ -112,7 +112,7 @@ var (
+ 			InflightDropped:  17,
+ 		},
+ 	}
+-	sysInfoJSON = []byte(`{"version":"2.0.0","started":1,"time":0,"uptime":2,"bytes_received":3,"bytes_sent":4,"clients_connected":5,"clients_disconnected":0,"clients_maximum":7,"clients_total":0,"messages_received":10,"messages_sent":11,"messages_dropped":20,"retained":15,"inflight":16,"inflight_dropped":17,"subscriptions":0,"packets_received":12,"packets_sent":13,"memory_alloc":0,"threads":0,"t":"info","id":"id"}`)
++	sysInfoJSON = []byte(`{"version":"2.0.0","started":1,"time":0,"uptime":2,"bytes_received":3,"bytes_sent":4,"clients_connected":5,"clients_disconnected":0,"clients_maximum":7,"clients_total":0,"messages_received":10,"messages_sent":11,"messages_dropped":20,"retained":15,"inflight":16,"inflight_dropped":17,"subscriptions":0,"packets_received":12,"packets_sent":13,"memory_alloc":0,"threads":0,"enhanced_auth_pending":0,"enhanced_auth_succeeded":0,"enhanced_auth_failed":0,"t":"info","id":"id"}`)
+ )
+ 
+ func TestClientMarshalBinary(t *testing.T) {
+diff --git a/mqtt/hooks_test.go b/mqtt/hooks_test.go
+index 94ed049..5744d46 100644
+--- a/mqtt/hooks_test.go
++++ b/mqtt/hooks_test.go
+@@ -402,6 +402,55 @@ func TestHooksOnAuthPacket(t *testing.T) {
+ 	require.Equal(t, uint16(10), pk.PacketID)
+ }
+ 
++// authStateObserverHook records OnAuthStateChange events without participating
++// in the enhanced authentication exchange.
++type authStateObserverHook struct {
++	HookBase
++	events []authStateEvent
++}
++
++type authStateEvent struct {
++	state  AuthState
++	method string
++	reason packets.Code
++}
++
++func (h *authStateObserverHook) ID() string { return "auth-state-observer" }
++
++func (h *authStateObserverHook) Provides(b byte) bool {
++	return b == OnAuthStateChange
++}
++
++func (h *authStateObserverHook) OnAuthStateChange(cl *Client, state AuthState, method string, reason packets.Code) {
++	h.events = append(h.events, authStateEvent{state: state, method: method, reason: reason})
++}
++
++func TestHooksOnAuthStateChange(t *testing.T) {
++	h := new(Hooks)
++	h.Log = logger
++
++	observer := new(authStateObserverHook)
++	require.NoError(t, h.Add(observer, nil))
++
++	// a hook that does not provide OnAuthStateChange must not be invoked.
++	other := new(modifiedHookBase) // Provides() returns true, but keeps HookBase no-op
++	require.NoError(t, h.Add(other, nil))
++
++	cl := new(Client)
++	h.OnAuthStateChange(cl, AuthStatePending, "SCRAM-SHA-256", packets.CodeSuccess)
++	h.OnAuthStateChange(cl, AuthStateAuthenticated, "SCRAM-SHA-256", packets.CodeSuccess)
++	h.OnAuthStateChange(cl, AuthStateFailed, "SCRAM-SHA-256", packets.ErrNotAuthorized)
++
++	require.Len(t, observer.events, 3)
++	require.Equal(t, authStateEvent{AuthStatePending, "SCRAM-SHA-256", packets.CodeSuccess}, observer.events[0])
++	require.Equal(t, authStateEvent{AuthStateAuthenticated, "SCRAM-SHA-256", packets.CodeSuccess}, observer.events[1])
++	require.Equal(t, authStateEvent{AuthStateFailed, "SCRAM-SHA-256", packets.ErrNotAuthorized}, observer.events[2])
++
++	// HookBase default implementation is a no-op.
++	base := new(HookBase)
++	base.OnAuthStateChange(cl, AuthStatePending, "m", packets.CodeSuccess)
++}
++
+ func TestHooksOnConnect(t *testing.T) {
+ 	h := new(Hooks)
+ 	h.Log = logger
+diff --git a/mqtt/rest/entity.go b/mqtt/rest/entity.go
+index f0eed6e..d599247 100644
+--- a/mqtt/rest/entity.go
++++ b/mqtt/rest/entity.go
+@@ -35,6 +35,8 @@ type client struct {
+ 	BytesReceived   int64     `json:"bytes_received"`
+ 	BytesSent       int64     `json:"bytes_sent"`
+ 	Keepalive       uint16    `json:"keepalive"`
++	AuthState       string    `json:"auth_state"`  // MQTT v5 enhanced auth: none/pending/reauthenticating/authenticated/failed
++	AuthMethod      string    `json:"auth_method"` // Authentication Method declared in CONNECT
+ }
+ 
+ func genClient(cl *mqtt.Client) client {
+@@ -58,6 +60,8 @@ func genClient(cl *mqtt.Client) client {
+ 		Keepalive:       cl.State.Keepalive,
+ 		BytesReceived:   cl.BytesRecv(),
+ 		BytesSent:       cl.BytesSent(),
++		AuthState:       cl.AuthState().String(),
++		AuthMethod:      cl.AuthenticationMethod(),
+ 	}
+ 	if cl.Properties.Will.Payload != nil {
+ 		nc.WillPayload = string(cl.Properties.Will.Payload)
+diff --git a/mqtt/rest/rest_test.go b/mqtt/rest/rest_test.go
+index d72350d..0081782 100644
+--- a/mqtt/rest/rest_test.go
++++ b/mqtt/rest/rest_test.go
+@@ -90,6 +90,27 @@ func TestGetClientsWithSearch(t *testing.T) {
+ 	require.Equal(t, "alpha-device", resp.Items[0].ID)
+ }
+ 
++func TestGetClientsExposeEnhancedAuthState(t *testing.T) {
++	_, server := newRestServer(t)
++
++	// a plain client (no Authentication Method) reports the none state
++	cl := server.NewClient(nil, "tcp", "client-plain", false)
++	cl.Net.Remote = "10.0.0.1:1234"
++	server.Clients.Add(cl)
++
++	r := &Rest{server: server}
++	req := httptest.NewRequest(http.MethodGet, "/api/v1/mqtt/clients", nil)
++	w := httptest.NewRecorder()
++	r.getClients(w, req)
++	require.Equal(t, http.StatusOK, w.Code)
++
++	var resp PagedResponse[client]
++	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
++	require.Len(t, resp.Items, 1)
++	require.Equal(t, "none", resp.Items[0].AuthState, "plain connections report auth_state=none")
++	require.Equal(t, "", resp.Items[0].AuthMethod, "plain connections report no auth method")
++}
++
+ func TestGetSubscriptions(t *testing.T) {
+ 	_, server := newRestServer(t)
+ 
+diff --git a/mqtt/server.go b/mqtt/server.go
+index 7327325..d067ae7 100644
+--- a/mqtt/server.go
++++ b/mqtt/server.go
+@@ -390,38 +390,41 @@ func (s *Server) attachClient(cl *Client, listener string) error {
+ 	}
+ 
+ 	cl.refreshDeadline(cl.State.Keepalive)
+-	if !s.hooks.OnConnectAuthenticate(cl, pk) { // [MQTT-3.1.4-2]
+-		err := s.SendConnack(cl, packets.ErrBadUsernameOrPassword, false, nil)
+-		if err != nil {
+-			return fmt.Errorf("invalid connection send ack: %w", err)
+-		}
+-
+-		return packets.ErrBadUsernameOrPassword
+-	}
+-
+-	atomic.AddInt64(&s.Info.ClientsConnected, 1)
+-	defer atomic.AddInt64(&s.Info.ClientsConnected, -1)
+ 
+-	s.hooks.OnSessionEstablish(cl, pk)
+-
+-	sessionPresent := s.inheritClientSession(pk, cl)
+-	s.Clients.Add(cl) // [MQTT-4.1.0-1]
+-
+-	err = s.SendConnack(cl, code, sessionPresent, nil) // [MQTT-3.1.4-5] [MQTT-3.2.0-1] [MQTT-3.2.0-2] &[MQTT-3.14.0-1]
+-	if err != nil {
+-		return fmt.Errorf("ack connection packet: %w", err)
+-	}
++	if s.enhancedAuthRequested(cl, pk) {
++		// MQTT v5 §4.12 enhanced authentication: the session (including any
++		// takeover of an existing client with the same id) is established only
++		// after the hook reports explicit success. Business packets stay gated
++		// until CONNACK is sent.
++		if err := s.beginEnhancedAuth(cl, pk); err != nil {
++			// Authentication failed, was abandoned (DISCONNECT) or the network
++			// dropped mid-handshake. No session was ever established, so there is
++			// nothing to expire; but OnDisconnect is fired for parity with the
++			// business-loop teardown (FR-13), so hooks that track connection
++			// lifecycle observe the interrupted attempt.
++			s.reconcileEnhancedAuthDisconnect(cl)
++			s.Log.Debug("client disconnected during enhanced authentication",
++				"error", err, "client", cl.ID, "remote", cl.Net.Remote, "listener", listener)
++			s.hooks.OnDisconnect(cl, err, false)
++			return err
++		}
++	} else {
++		if !s.hooks.OnConnectAuthenticate(cl, pk) { // [MQTT-3.1.4-2]
++			err := s.SendConnack(cl, packets.ErrBadUsernameOrPassword, false, nil)
++			if err != nil {
++				return fmt.Errorf("invalid connection send ack: %w", err)
++			}
+ 
+-	s.loop.willDelayed.Delete(cl.ID) // [MQTT-3.1.3-9]
++			return packets.ErrBadUsernameOrPassword
++		}
+ 
+-	if sessionPresent {
+-		err = cl.ResendInflightMessages(true)
+-		if err != nil {
+-			return fmt.Errorf("resend inflight: %w", err)
++		if err := s.establishClientSession(cl, pk); err != nil {
++			return err
+ 		}
+ 	}
+ 
+-	s.hooks.OnSessionEstablished(cl, pk)
++	atomic.AddInt64(&s.Info.ClientsConnected, 1)
++	defer atomic.AddInt64(&s.Info.ClientsConnected, -1)
+ 
+ 	err = cl.Read(s.receivePacket)
+ 	if err != nil {
+@@ -432,6 +435,8 @@ func (s *Server) attachClient(cl *Client, listener string) error {
+ 	}
+ 	s.Log.Debug("client disconnected", "error", err, "client", cl.ID, "remote", cl.Net.Remote, "listener", listener)
+ 
++	s.reconcileEnhancedAuthDisconnect(cl)
++
+ 	expire := (cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval == 0) || (cl.Properties.ProtocolVersion < 5 && cl.Properties.Clean)
+ 	s.hooks.OnDisconnect(cl, err, expire)
+ 
+@@ -465,6 +470,34 @@ func (s *Server) readConnectionPacket(cl *Client) (pk packets.Packet, err error)
+ 	return
+ }
+ 
++// establishClientSession performs the one-time session establishment steps shared
++// by the legacy connect path and the enhanced-authentication success path:
++// session hooks, session inheritance/takeover, client registration, CONNACK,
++// delayed-will cleanup and inflight resend. It must be invoked exactly once per
++// connection; the enhanced authentication state machine guards this with a CAS.
++func (s *Server) establishClientSession(cl *Client, pk packets.Packet) error {
++	s.hooks.OnSessionEstablish(cl, pk)
++
++	sessionPresent := s.inheritClientSession(pk, cl)
++	s.Clients.Add(cl) // [MQTT-4.1.0-1]
++
++	err := s.SendConnack(cl, packets.CodeSuccess, sessionPresent, nil) // [MQTT-3.1.4-5] [MQTT-3.2.0-1] [MQTT-3.2.0-2] &[MQTT-3.14.0-1]
++	if err != nil {
++		return fmt.Errorf("ack connection packet: %w", err)
++	}
++
++	s.loop.willDelayed.Delete(cl.ID) // [MQTT-3.1.3-9]
++
++	if sessionPresent {
++		if err := cl.ResendInflightMessages(true); err != nil {
++			return fmt.Errorf("resend inflight: %w", err)
++		}
++	}
++
++	s.hooks.OnSessionEstablished(cl, pk)
++	return nil
++}
++
+ // receivePacket processes an incoming packet for a client, and issues a disconnect to the client
+ // if an error has occurred (if mqtt v5).
+ func (s *Server) receivePacket(cl *Client, pk packets.Packet) error {
+@@ -1525,16 +1558,6 @@ func (s *Server) UnsubscribeClient(cl *Client) {
+ 	s.hooks.OnUnsubscribed(cl, packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Unsubscribe}, Filters: filters}, reasonCodes, counts)
+ }
+ 
+-// processAuth processes an Auth packet.
+-func (s *Server) processAuth(cl *Client, pk packets.Packet) error {
+-	_, err := s.hooks.OnAuthPacket(cl, pk)
+-	if err != nil {
+-		return err
+-	}
+-
+-	return nil
+-}
+-
+ // processDisconnect processes a Disconnect packet.
+ func (s *Server) processDisconnect(cl *Client, pk packets.Packet) error {
+ 	if pk.Properties.SessionExpiryIntervalFlag {
+@@ -1601,26 +1624,29 @@ func (s *Server) publishSysTopics() {
+ 	atomic.StoreInt64(&s.Info.ClientsDisconnected, atomic.LoadInt64(&s.Info.ClientsTotal)-atomic.LoadInt64(&s.Info.ClientsConnected))
+ 
+ 	topics := map[string]string{
+-		SysPrefix + "/broker/version":              s.Info.Version,
+-		SysPrefix + "/broker/time":                 AtomicItoa(&s.Info.Time),
+-		SysPrefix + "/broker/uptime":               AtomicItoa(&s.Info.Uptime),
+-		SysPrefix + "/broker/started":              AtomicItoa(&s.Info.Started),
+-		SysPrefix + "/broker/load/bytes/received":  AtomicItoa(&s.Info.BytesReceived),
+-		SysPrefix + "/broker/load/bytes/sent":      AtomicItoa(&s.Info.BytesSent),
+-		SysPrefix + "/broker/clients/connected":    AtomicItoa(&s.Info.ClientsConnected),
+-		SysPrefix + "/broker/clients/disconnected": AtomicItoa(&s.Info.ClientsDisconnected),
+-		SysPrefix + "/broker/clients/maximum":      AtomicItoa(&s.Info.ClientsMaximum),
+-		SysPrefix + "/broker/clients/total":        AtomicItoa(&s.Info.ClientsTotal),
+-		SysPrefix + "/broker/packets/received":     AtomicItoa(&s.Info.PacketsReceived),
+-		SysPrefix + "/broker/packets/sent":         AtomicItoa(&s.Info.PacketsSent),
+-		SysPrefix + "/broker/messages/received":    AtomicItoa(&s.Info.MessagesReceived),
+-		SysPrefix + "/broker/messages/sent":        AtomicItoa(&s.Info.MessagesSent),
+-		SysPrefix + "/broker/messages/dropped":     AtomicItoa(&s.Info.MessagesDropped),
+-		SysPrefix + "/broker/messages/inflight":    AtomicItoa(&s.Info.Inflight),
+-		SysPrefix + "/broker/retained":             AtomicItoa(&s.Info.Retained),
+-		SysPrefix + "/broker/subscriptions":        AtomicItoa(&s.Info.Subscriptions),
+-		SysPrefix + "/broker/system/memory":        AtomicItoa(&s.Info.MemoryAlloc),
+-		SysPrefix + "/broker/system/threads":       AtomicItoa(&s.Info.Threads),
++		SysPrefix + "/broker/version":                 s.Info.Version,
++		SysPrefix + "/broker/time":                    AtomicItoa(&s.Info.Time),
++		SysPrefix + "/broker/uptime":                  AtomicItoa(&s.Info.Uptime),
++		SysPrefix + "/broker/started":                 AtomicItoa(&s.Info.Started),
++		SysPrefix + "/broker/load/bytes/received":     AtomicItoa(&s.Info.BytesReceived),
++		SysPrefix + "/broker/load/bytes/sent":         AtomicItoa(&s.Info.BytesSent),
++		SysPrefix + "/broker/clients/connected":       AtomicItoa(&s.Info.ClientsConnected),
++		SysPrefix + "/broker/clients/disconnected":    AtomicItoa(&s.Info.ClientsDisconnected),
++		SysPrefix + "/broker/clients/maximum":         AtomicItoa(&s.Info.ClientsMaximum),
++		SysPrefix + "/broker/clients/total":           AtomicItoa(&s.Info.ClientsTotal),
++		SysPrefix + "/broker/packets/received":        AtomicItoa(&s.Info.PacketsReceived),
++		SysPrefix + "/broker/packets/sent":            AtomicItoa(&s.Info.PacketsSent),
++		SysPrefix + "/broker/messages/received":       AtomicItoa(&s.Info.MessagesReceived),
++		SysPrefix + "/broker/messages/sent":           AtomicItoa(&s.Info.MessagesSent),
++		SysPrefix + "/broker/messages/dropped":        AtomicItoa(&s.Info.MessagesDropped),
++		SysPrefix + "/broker/messages/inflight":       AtomicItoa(&s.Info.Inflight),
++		SysPrefix + "/broker/retained":                AtomicItoa(&s.Info.Retained),
++		SysPrefix + "/broker/subscriptions":           AtomicItoa(&s.Info.Subscriptions),
++		SysPrefix + "/broker/system/memory":           AtomicItoa(&s.Info.MemoryAlloc),
++		SysPrefix + "/broker/system/threads":          AtomicItoa(&s.Info.Threads),
++		SysPrefix + "/broker/auth/enhanced/pending":   AtomicItoa(&s.Info.EnhancedAuthPending),
++		SysPrefix + "/broker/auth/enhanced/succeeded": AtomicItoa(&s.Info.EnhancedAuthSucceeded),
++		SysPrefix + "/broker/auth/enhanced/failed":    AtomicItoa(&s.Info.EnhancedAuthFailed),
+ 	}
+ 
+ 	for topic, payload := range topics {
+diff --git a/mqtt/server_test.go b/mqtt/server_test.go
+index d855c50..83428d6 100644
+--- a/mqtt/server_test.go
++++ b/mqtt/server_test.go
+@@ -3030,12 +3030,19 @@ func TestServerProcessPacketDisconnectNonZeroExpiryViolation(t *testing.T) {
+ }
+ 
+ func TestServerProcessPacketAuth(t *testing.T) {
++	// MQTT v5.0 §4.12: an AUTH packet is only legal inside an enhanced
++	// authentication lifecycle (CONNECT declared an Authentication Method and
++	// a hook is participating). This client never entered enhanced
++	// authentication, so the AUTH packet is a protocol error; processPacket
++	// emits nothing itself (receivePacket sends the DISCONNECT).
+ 	s := newServer()
+ 	cl, r, w := newTestClient()
++	cl.Properties.ProtocolVersion = 5
+ 
+ 	go func() {
+ 		err := s.processPacket(cl, *packets.TPacketData[packets.Auth].Get(packets.TAuth).Packet)
+-		require.NoError(t, err)
++		require.Error(t, err)
++		require.ErrorIs(t, err, packets.ErrProtocolViolation)
+ 		_ = w.Close()
+ 	}()
+ 
+@@ -3055,17 +3062,29 @@ func TestServerProcessPacketAuthInvalidReason(t *testing.T) {
+ }
+ 
+ func TestServerProcessPacketAuthFailure(t *testing.T) {
++	// MQTT v5.0 §4.12.2: during re-authentication a hook error must settle the
++	// client into the failed state and surface a deterministic reason code.
+ 	s := newServer()
+ 	cl, _, _ := newTestClient()
++	cl.Properties.ProtocolVersion = 5
++	cl.setAuthMethod("SHA-1")
++	cl.storeAuthState(AuthStateAuthenticated)
++	require.True(t, cl.casAuthState(AuthStateAuthenticated, AuthStateReAuthenticating))
+ 
+ 	hook := new(modifiedHookBase)
+ 	hook.fail = true
+-	err := s.AddHook(hook, nil)
+-	require.NoError(t, err)
++	hook.err = packets.ErrNotAuthorized
++	require.NoError(t, s.AddHook(hook, nil))
+ 
+-	err = s.processAuth(cl, *packets.TPacketData[packets.Auth].Get(packets.TAuth).Packet)
++	pk := *packets.TPacketData[packets.Auth].Get(packets.TAuth).Packet
++	pk.ReasonCode = packets.CodeContinueAuthentication.Code // continuation of re-auth
++	pk.Properties.AuthenticationMethod = "SHA-1"
++
++	err := s.processAuth(cl, pk)
+ 	require.Error(t, err)
+-	require.ErrorIs(t, errTestHook, err)
++	require.ErrorIs(t, err, packets.ErrNotAuthorized)
++	require.Equal(t, AuthStateFailed, cl.AuthState())
++	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.EnhancedAuthFailed))
+ }
+ 
+ func TestServerSendLWT(t *testing.T) {
+diff --git a/mqtt/system/system.go b/mqtt/system/system.go
+index 72fc29f..09effda 100644
+--- a/mqtt/system/system.go
++++ b/mqtt/system/system.go
+@@ -14,27 +14,30 @@ import (
+ // commonly found in $SYS topics (and others).
+ // based on https://github.com/mqtt/mqtt.org/wiki/SYS-Topics
+ type Info struct {
+-	Version             string `json:"version"`              // the current version of the server
+-	Started             int64  `json:"started"`              // the time the server started in unix seconds
+-	Time                int64  `json:"time"`                 // current time on the server
+-	Uptime              int64  `json:"uptime"`               // the number of seconds the server has been online
+-	BytesReceived       int64  `json:"bytes_received"`       // total number of bytes received since the broker started
+-	BytesSent           int64  `json:"bytes_sent"`           // total number of bytes sent since the broker started
+-	ClientsConnected    int64  `json:"clients_connected"`    // number of currently connected clients
+-	ClientsDisconnected int64  `json:"clients_disconnected"` // total number of persistent clients (with clean session disabled) that are registered at the broker but are currently disconnected
+-	ClientsMaximum      int64  `json:"clients_maximum"`      // maximum number of active clients that have been connected
+-	ClientsTotal        int64  `json:"clients_total"`        // total number of connected and disconnected clients with a persistent session currently connected and registered
+-	MessagesReceived    int64  `json:"messages_received"`    // total number of publish messages received
+-	MessagesSent        int64  `json:"messages_sent"`        // total number of publish messages sent
+-	MessagesDropped     int64  `json:"messages_dropped"`     // total number of publish messages dropped to slow subscriber
+-	Retained            int64  `json:"retained"`             // total number of retained messages active on the broker
+-	Inflight            int64  `json:"inflight"`             // the number of messages currently in-flight
+-	InflightDropped     int64  `json:"inflight_dropped"`     // the number of inflight messages which were dropped
+-	Subscriptions       int64  `json:"subscriptions"`        // total number of subscriptions active on the broker
+-	PacketsReceived     int64  `json:"packets_received"`     // the total number of publish messages received
+-	PacketsSent         int64  `json:"packets_sent"`         // total number of messages of any type sent since the broker started
+-	MemoryAlloc         int64  `json:"memory_alloc"`         // memory currently allocated (in bytes)
+-	Threads             int64  `json:"threads"`              // number of active goroutines, named as threads for platform ambiguity
++	Version               string `json:"version"`                 // the current version of the server
++	Started               int64  `json:"started"`                 // the time the server started in unix seconds
++	Time                  int64  `json:"time"`                    // current time on the server
++	Uptime                int64  `json:"uptime"`                  // the number of seconds the server has been online
++	BytesReceived         int64  `json:"bytes_received"`          // total number of bytes received since the broker started
++	BytesSent             int64  `json:"bytes_sent"`              // total number of bytes sent since the broker started
++	ClientsConnected      int64  `json:"clients_connected"`       // number of currently connected clients
++	ClientsDisconnected   int64  `json:"clients_disconnected"`    // total number of persistent clients (with clean session disabled) that are registered at the broker but are currently disconnected
++	ClientsMaximum        int64  `json:"clients_maximum"`         // maximum number of active clients that have been connected
++	ClientsTotal          int64  `json:"clients_total"`           // total number of connected and disconnected clients with a persistent session currently connected and registered
++	MessagesReceived      int64  `json:"messages_received"`       // total number of publish messages received
++	MessagesSent          int64  `json:"messages_sent"`           // total number of publish messages sent
++	MessagesDropped       int64  `json:"messages_dropped"`        // total number of publish messages dropped to slow subscriber
++	Retained              int64  `json:"retained"`                // total number of retained messages active on the broker
++	Inflight              int64  `json:"inflight"`                // the number of messages currently in-flight
++	InflightDropped       int64  `json:"inflight_dropped"`        // the number of inflight messages which were dropped
++	Subscriptions         int64  `json:"subscriptions"`           // total number of subscriptions active on the broker
++	PacketsReceived       int64  `json:"packets_received"`        // the total number of publish messages received
++	PacketsSent           int64  `json:"packets_sent"`            // total number of messages of any type sent since the broker started
++	MemoryAlloc           int64  `json:"memory_alloc"`            // memory currently allocated (in bytes)
++	Threads               int64  `json:"threads"`                 // number of active goroutines, named as threads for platform ambiguity
++	EnhancedAuthPending   int64  `json:"enhanced_auth_pending"`   // number of clients currently in an enhanced authentication exchange (handshake or re-authentication)
++	EnhancedAuthSucceeded int64  `json:"enhanced_auth_succeeded"` // total number of enhanced authentication exchanges completed successfully
++	EnhancedAuthFailed    int64  `json:"enhanced_auth_failed"`    // total number of enhanced authentication exchanges which failed
+ }
+ 
+ func (i *Info) RegisterPrometheus() *prometheus.Registry {
+@@ -192,32 +195,62 @@ func (i *Info) RegisterPrometheus() *prometheus.Registry {
+ 			return float64(atomic.LoadInt64(&i.Threads))
+ 		}),
+ 	)
++	promReg.MustRegister(prometheus.NewGaugeFunc(
++		prometheus.GaugeOpts{
++			Name: "enhanced_auth_pending",
++			Help: "number of clients currently in an enhanced authentication exchange (handshake or re-authentication)",
++		},
++		func() float64 {
++			return float64(atomic.LoadInt64(&i.EnhancedAuthPending))
++		}),
++	)
++	promReg.MustRegister(prometheus.NewCounterFunc(
++		prometheus.CounterOpts{
++			Name: "enhanced_auth_succeeded",
++			Help: "total number of enhanced authentication exchanges completed successfully",
++		},
++		func() float64 {
++			return float64(atomic.LoadInt64(&i.EnhancedAuthSucceeded))
++		}),
++	)
++	promReg.MustRegister(prometheus.NewCounterFunc(
++		prometheus.CounterOpts{
++			Name: "enhanced_auth_failed",
++			Help: "total number of enhanced authentication exchanges which failed",
++		},
++		func() float64 {
++			return float64(atomic.LoadInt64(&i.EnhancedAuthFailed))
++		}),
++	)
+ 	return promReg
+ }
+ 
+ // Clone makes a copy of Info using atomic operation
+ func (i *Info) Clone() *Info {
+ 	return &Info{
+-		Version:             i.Version,
+-		Started:             atomic.LoadInt64(&i.Started),
+-		Time:                atomic.LoadInt64(&i.Time),
+-		Uptime:              atomic.LoadInt64(&i.Uptime),
+-		BytesReceived:       atomic.LoadInt64(&i.BytesReceived),
+-		BytesSent:           atomic.LoadInt64(&i.BytesSent),
+-		ClientsConnected:    atomic.LoadInt64(&i.ClientsConnected),
+-		ClientsMaximum:      atomic.LoadInt64(&i.ClientsMaximum),
+-		ClientsTotal:        atomic.LoadInt64(&i.ClientsTotal),
+-		ClientsDisconnected: atomic.LoadInt64(&i.ClientsDisconnected),
+-		MessagesReceived:    atomic.LoadInt64(&i.MessagesReceived),
+-		MessagesSent:        atomic.LoadInt64(&i.MessagesSent),
+-		MessagesDropped:     atomic.LoadInt64(&i.MessagesDropped),
+-		Retained:            atomic.LoadInt64(&i.Retained),
+-		Inflight:            atomic.LoadInt64(&i.Inflight),
+-		InflightDropped:     atomic.LoadInt64(&i.InflightDropped),
+-		Subscriptions:       atomic.LoadInt64(&i.Subscriptions),
+-		PacketsReceived:     atomic.LoadInt64(&i.PacketsReceived),
+-		PacketsSent:         atomic.LoadInt64(&i.PacketsSent),
+-		MemoryAlloc:         atomic.LoadInt64(&i.MemoryAlloc),
+-		Threads:             atomic.LoadInt64(&i.Threads),
++		Version:               i.Version,
++		Started:               atomic.LoadInt64(&i.Started),
++		Time:                  atomic.LoadInt64(&i.Time),
++		Uptime:                atomic.LoadInt64(&i.Uptime),
++		BytesReceived:         atomic.LoadInt64(&i.BytesReceived),
++		BytesSent:             atomic.LoadInt64(&i.BytesSent),
++		ClientsConnected:      atomic.LoadInt64(&i.ClientsConnected),
++		ClientsMaximum:        atomic.LoadInt64(&i.ClientsMaximum),
++		ClientsTotal:          atomic.LoadInt64(&i.ClientsTotal),
++		ClientsDisconnected:   atomic.LoadInt64(&i.ClientsDisconnected),
++		MessagesReceived:      atomic.LoadInt64(&i.MessagesReceived),
++		MessagesSent:          atomic.LoadInt64(&i.MessagesSent),
++		MessagesDropped:       atomic.LoadInt64(&i.MessagesDropped),
++		Retained:              atomic.LoadInt64(&i.Retained),
++		Inflight:              atomic.LoadInt64(&i.Inflight),
++		InflightDropped:       atomic.LoadInt64(&i.InflightDropped),
++		Subscriptions:         atomic.LoadInt64(&i.Subscriptions),
++		PacketsReceived:       atomic.LoadInt64(&i.PacketsReceived),
++		PacketsSent:           atomic.LoadInt64(&i.PacketsSent),
++		MemoryAlloc:           atomic.LoadInt64(&i.MemoryAlloc),
++		Threads:               atomic.LoadInt64(&i.Threads),
++		EnhancedAuthPending:   atomic.LoadInt64(&i.EnhancedAuthPending),
++		EnhancedAuthSucceeded: atomic.LoadInt64(&i.EnhancedAuthSucceeded),
++		EnhancedAuthFailed:    atomic.LoadInt64(&i.EnhancedAuthFailed),
+ 	}
+ }
+diff --git a/mqtt/system/system_test.go b/mqtt/system/system_test.go
+index b76df21..dacd92e 100644
+--- a/mqtt/system/system_test.go
++++ b/mqtt/system/system_test.go
+@@ -1,6 +1,7 @@
+ package system
+ 
+ import (
++	"sync/atomic"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/require"
+@@ -8,30 +9,53 @@ import (
+ 
+ func TestClone(t *testing.T) {
+ 	o := &Info{
+-		Version:             "version",
+-		Started:             1,
+-		Time:                2,
+-		Uptime:              3,
+-		BytesReceived:       4,
+-		BytesSent:           5,
+-		ClientsConnected:    6,
+-		ClientsMaximum:      7,
+-		ClientsTotal:        8,
+-		ClientsDisconnected: 9,
+-		MessagesReceived:    10,
+-		MessagesSent:        11,
+-		MessagesDropped:     20,
+-		Retained:            12,
+-		Inflight:            13,
+-		InflightDropped:     14,
+-		Subscriptions:       15,
+-		PacketsReceived:     16,
+-		PacketsSent:         17,
+-		MemoryAlloc:         18,
+-		Threads:             19,
++		Version:               "version",
++		Started:               1,
++		Time:                  2,
++		Uptime:                3,
++		BytesReceived:         4,
++		BytesSent:             5,
++		ClientsConnected:      6,
++		ClientsMaximum:        7,
++		ClientsTotal:          8,
++		ClientsDisconnected:   9,
++		MessagesReceived:      10,
++		MessagesSent:          11,
++		MessagesDropped:       20,
++		Retained:              12,
++		Inflight:              13,
++		InflightDropped:       14,
++		Subscriptions:         15,
++		PacketsReceived:       16,
++		PacketsSent:           17,
++		MemoryAlloc:           18,
++		Threads:               19,
++		EnhancedAuthPending:   2,
++		EnhancedAuthSucceeded: 7,
++		EnhancedAuthFailed:    3,
+ 	}
+ 
+ 	n := o.Clone()
+ 
+ 	require.Equal(t, o, n)
+ }
++
++func TestEnhancedAuthMetricsRegistered(t *testing.T) {
++	i := &Info{}
++	reg := i.RegisterPrometheus()
++
++	atomic.StoreInt64(&i.EnhancedAuthPending, 1)
++	atomic.StoreInt64(&i.EnhancedAuthSucceeded, 5)
++	atomic.StoreInt64(&i.EnhancedAuthFailed, 2)
++
++	families, err := reg.Gather()
++	require.NoError(t, err)
++
++	names := map[string]bool{}
++	for _, f := range families {
++		names[f.GetName()] = true
++	}
++	require.True(t, names["enhanced_auth_pending"])
++	require.True(t, names["enhanced_auth_succeeded"])
++	require.True(t, names["enhanced_auth_failed"])
++}

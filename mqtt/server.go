@@ -390,38 +390,41 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	}
 
 	cl.refreshDeadline(cl.State.Keepalive)
-	if !s.hooks.OnConnectAuthenticate(cl, pk) { // [MQTT-3.1.4-2]
-		err := s.SendConnack(cl, packets.ErrBadUsernameOrPassword, false, nil)
-		if err != nil {
-			return fmt.Errorf("invalid connection send ack: %w", err)
+
+	if s.enhancedAuthRequested(cl, pk) {
+		// MQTT v5 §4.12 enhanced authentication: the session (including any
+		// takeover of an existing client with the same id) is established only
+		// after the hook reports explicit success. Business packets stay gated
+		// until CONNACK is sent.
+		if err := s.beginEnhancedAuth(cl, pk); err != nil {
+			// Authentication failed, was abandoned (DISCONNECT) or the network
+			// dropped mid-handshake. No session was ever established, so there is
+			// nothing to expire; but OnDisconnect is fired for parity with the
+			// business-loop teardown (FR-13), so hooks that track connection
+			// lifecycle observe the interrupted attempt.
+			s.reconcileEnhancedAuthDisconnect(cl)
+			s.Log.Debug("client disconnected during enhanced authentication",
+				"error", err, "client", cl.ID, "remote", cl.Net.Remote, "listener", listener)
+			s.hooks.OnDisconnect(cl, err, false)
+			return err
+		}
+	} else {
+		if !s.hooks.OnConnectAuthenticate(cl, pk) { // [MQTT-3.1.4-2]
+			err := s.SendConnack(cl, packets.ErrBadUsernameOrPassword, false, nil)
+			if err != nil {
+				return fmt.Errorf("invalid connection send ack: %w", err)
+			}
+
+			return packets.ErrBadUsernameOrPassword
 		}
 
-		return packets.ErrBadUsernameOrPassword
+		if err := s.establishClientSession(cl, pk); err != nil {
+			return err
+		}
 	}
 
 	atomic.AddInt64(&s.Info.ClientsConnected, 1)
 	defer atomic.AddInt64(&s.Info.ClientsConnected, -1)
-
-	s.hooks.OnSessionEstablish(cl, pk)
-
-	sessionPresent := s.inheritClientSession(pk, cl)
-	s.Clients.Add(cl) // [MQTT-4.1.0-1]
-
-	err = s.SendConnack(cl, code, sessionPresent, nil) // [MQTT-3.1.4-5] [MQTT-3.2.0-1] [MQTT-3.2.0-2] &[MQTT-3.14.0-1]
-	if err != nil {
-		return fmt.Errorf("ack connection packet: %w", err)
-	}
-
-	s.loop.willDelayed.Delete(cl.ID) // [MQTT-3.1.3-9]
-
-	if sessionPresent {
-		err = cl.ResendInflightMessages(true)
-		if err != nil {
-			return fmt.Errorf("resend inflight: %w", err)
-		}
-	}
-
-	s.hooks.OnSessionEstablished(cl, pk)
 
 	err = cl.Read(s.receivePacket)
 	if err != nil {
@@ -431,6 +434,8 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 		cl.Properties.Will = Will{} // [MQTT-3.14.4-3] [MQTT-3.1.2-10]
 	}
 	s.Log.Debug("client disconnected", "error", err, "client", cl.ID, "remote", cl.Net.Remote, "listener", listener)
+
+	s.reconcileEnhancedAuthDisconnect(cl)
 
 	expire := (cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval == 0) || (cl.Properties.ProtocolVersion < 5 && cl.Properties.Clean)
 	s.hooks.OnDisconnect(cl, err, expire)
@@ -463,6 +468,34 @@ func (s *Server) readConnectionPacket(cl *Client) (pk packets.Packet, err error)
 	}
 
 	return
+}
+
+// establishClientSession performs the one-time session establishment steps shared
+// by the legacy connect path and the enhanced-authentication success path:
+// session hooks, session inheritance/takeover, client registration, CONNACK,
+// delayed-will cleanup and inflight resend. It must be invoked exactly once per
+// connection; the enhanced authentication state machine guards this with a CAS.
+func (s *Server) establishClientSession(cl *Client, pk packets.Packet) error {
+	s.hooks.OnSessionEstablish(cl, pk)
+
+	sessionPresent := s.inheritClientSession(pk, cl)
+	s.Clients.Add(cl) // [MQTT-4.1.0-1]
+
+	err := s.SendConnack(cl, packets.CodeSuccess, sessionPresent, nil) // [MQTT-3.1.4-5] [MQTT-3.2.0-1] [MQTT-3.2.0-2] &[MQTT-3.14.0-1]
+	if err != nil {
+		return fmt.Errorf("ack connection packet: %w", err)
+	}
+
+	s.loop.willDelayed.Delete(cl.ID) // [MQTT-3.1.3-9]
+
+	if sessionPresent {
+		if err := cl.ResendInflightMessages(true); err != nil {
+			return fmt.Errorf("resend inflight: %w", err)
+		}
+	}
+
+	s.hooks.OnSessionEstablished(cl, pk)
+	return nil
 }
 
 // receivePacket processes an incoming packet for a client, and issues a disconnect to the client
@@ -1525,16 +1558,6 @@ func (s *Server) UnsubscribeClient(cl *Client) {
 	s.hooks.OnUnsubscribed(cl, packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Unsubscribe}, Filters: filters}, reasonCodes, counts)
 }
 
-// processAuth processes an Auth packet.
-func (s *Server) processAuth(cl *Client, pk packets.Packet) error {
-	_, err := s.hooks.OnAuthPacket(cl, pk)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // processDisconnect processes a Disconnect packet.
 func (s *Server) processDisconnect(cl *Client, pk packets.Packet) error {
 	if pk.Properties.SessionExpiryIntervalFlag {
@@ -1601,26 +1624,29 @@ func (s *Server) publishSysTopics() {
 	atomic.StoreInt64(&s.Info.ClientsDisconnected, atomic.LoadInt64(&s.Info.ClientsTotal)-atomic.LoadInt64(&s.Info.ClientsConnected))
 
 	topics := map[string]string{
-		SysPrefix + "/broker/version":              s.Info.Version,
-		SysPrefix + "/broker/time":                 AtomicItoa(&s.Info.Time),
-		SysPrefix + "/broker/uptime":               AtomicItoa(&s.Info.Uptime),
-		SysPrefix + "/broker/started":              AtomicItoa(&s.Info.Started),
-		SysPrefix + "/broker/load/bytes/received":  AtomicItoa(&s.Info.BytesReceived),
-		SysPrefix + "/broker/load/bytes/sent":      AtomicItoa(&s.Info.BytesSent),
-		SysPrefix + "/broker/clients/connected":    AtomicItoa(&s.Info.ClientsConnected),
-		SysPrefix + "/broker/clients/disconnected": AtomicItoa(&s.Info.ClientsDisconnected),
-		SysPrefix + "/broker/clients/maximum":      AtomicItoa(&s.Info.ClientsMaximum),
-		SysPrefix + "/broker/clients/total":        AtomicItoa(&s.Info.ClientsTotal),
-		SysPrefix + "/broker/packets/received":     AtomicItoa(&s.Info.PacketsReceived),
-		SysPrefix + "/broker/packets/sent":         AtomicItoa(&s.Info.PacketsSent),
-		SysPrefix + "/broker/messages/received":    AtomicItoa(&s.Info.MessagesReceived),
-		SysPrefix + "/broker/messages/sent":        AtomicItoa(&s.Info.MessagesSent),
-		SysPrefix + "/broker/messages/dropped":     AtomicItoa(&s.Info.MessagesDropped),
-		SysPrefix + "/broker/messages/inflight":    AtomicItoa(&s.Info.Inflight),
-		SysPrefix + "/broker/retained":             AtomicItoa(&s.Info.Retained),
-		SysPrefix + "/broker/subscriptions":        AtomicItoa(&s.Info.Subscriptions),
-		SysPrefix + "/broker/system/memory":        AtomicItoa(&s.Info.MemoryAlloc),
-		SysPrefix + "/broker/system/threads":       AtomicItoa(&s.Info.Threads),
+		SysPrefix + "/broker/version":                 s.Info.Version,
+		SysPrefix + "/broker/time":                    AtomicItoa(&s.Info.Time),
+		SysPrefix + "/broker/uptime":                  AtomicItoa(&s.Info.Uptime),
+		SysPrefix + "/broker/started":                 AtomicItoa(&s.Info.Started),
+		SysPrefix + "/broker/load/bytes/received":     AtomicItoa(&s.Info.BytesReceived),
+		SysPrefix + "/broker/load/bytes/sent":         AtomicItoa(&s.Info.BytesSent),
+		SysPrefix + "/broker/clients/connected":       AtomicItoa(&s.Info.ClientsConnected),
+		SysPrefix + "/broker/clients/disconnected":    AtomicItoa(&s.Info.ClientsDisconnected),
+		SysPrefix + "/broker/clients/maximum":         AtomicItoa(&s.Info.ClientsMaximum),
+		SysPrefix + "/broker/clients/total":           AtomicItoa(&s.Info.ClientsTotal),
+		SysPrefix + "/broker/packets/received":        AtomicItoa(&s.Info.PacketsReceived),
+		SysPrefix + "/broker/packets/sent":            AtomicItoa(&s.Info.PacketsSent),
+		SysPrefix + "/broker/messages/received":       AtomicItoa(&s.Info.MessagesReceived),
+		SysPrefix + "/broker/messages/sent":           AtomicItoa(&s.Info.MessagesSent),
+		SysPrefix + "/broker/messages/dropped":        AtomicItoa(&s.Info.MessagesDropped),
+		SysPrefix + "/broker/messages/inflight":       AtomicItoa(&s.Info.Inflight),
+		SysPrefix + "/broker/retained":                AtomicItoa(&s.Info.Retained),
+		SysPrefix + "/broker/subscriptions":           AtomicItoa(&s.Info.Subscriptions),
+		SysPrefix + "/broker/system/memory":           AtomicItoa(&s.Info.MemoryAlloc),
+		SysPrefix + "/broker/system/threads":          AtomicItoa(&s.Info.Threads),
+		SysPrefix + "/broker/auth/enhanced/pending":   AtomicItoa(&s.Info.EnhancedAuthPending),
+		SysPrefix + "/broker/auth/enhanced/succeeded": AtomicItoa(&s.Info.EnhancedAuthSucceeded),
+		SysPrefix + "/broker/auth/enhanced/failed":    AtomicItoa(&s.Info.EnhancedAuthFailed),
 	}
 
 	for topic, payload := range topics {

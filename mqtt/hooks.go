@@ -28,6 +28,7 @@ const (
 	OnSessionEstablished
 	OnDisconnect
 	OnAuthPacket
+	OnAuthStateChange
 	OnPacketRead
 	OnPacketEncode
 	OnPacketSent
@@ -85,10 +86,11 @@ type Hook interface {
 	OnSessionEstablished(cl *Client, pk packets.Packet)
 	OnDisconnect(cl *Client, err error, expire bool)
 	OnAuthPacket(cl *Client, pk packets.Packet) (packets.Packet, error)
-	OnPacketRead(cl *Client, pk packets.Packet) (packets.Packet, error) // triggers when a new packet is received by a client, but before packet validation
-	OnPacketEncode(cl *Client, pk packets.Packet) packets.Packet        // modify a packet before it is byte-encoded and written to the client
-	OnPacketSent(cl *Client, pk packets.Packet, b []byte)               // triggers when packet bytes have been written to the client
-	OnPacketProcessed(cl *Client, pk packets.Packet, err error)         // triggers after a packet from the client been processed (handled)
+	OnAuthStateChange(cl *Client, state AuthState, method string, reason packets.Code) // triggers when the MQTT v5 enhanced authentication state changes (pending/reauthenticating/authenticated/failed)
+	OnPacketRead(cl *Client, pk packets.Packet) (packets.Packet, error)                // triggers when a new packet is received by a client, but before packet validation
+	OnPacketEncode(cl *Client, pk packets.Packet) packets.Packet                       // modify a packet before it is byte-encoded and written to the client
+	OnPacketSent(cl *Client, pk packets.Packet, b []byte)                              // triggers when packet bytes have been written to the client
+	OnPacketProcessed(cl *Client, pk packets.Packet, err error)                        // triggers after a packet from the client been processed (handled)
 	OnSubscribe(cl *Client, pk packets.Packet) packets.Packet
 	OnSubscribed(cl *Client, pk packets.Packet, reasonCodes []byte, counts []int) // counts is an array of the number of subscribers for the same filter
 	OnSelectSubscribers(subs *Subscribers, pk packets.Packet) *Subscribers
@@ -304,6 +306,17 @@ func (h *Hooks) OnAuthPacket(cl *Client, pk packets.Packet) (pkx packets.Packet,
 	}
 
 	return
+}
+
+// OnAuthStateChange is called when the MQTT v5 enhanced authentication state of a
+// client changes (pending, reauthenticating, authenticated, failed). It is an
+// observational event: hooks do not participate in the challenge exchange here.
+func (h *Hooks) OnAuthStateChange(cl *Client, state AuthState, method string, reason packets.Code) {
+	for _, hook := range h.GetAll() {
+		if hook.Provides(OnAuthStateChange) {
+			hook.OnAuthStateChange(cl, state, method, reason)
+		}
+	}
 }
 
 // OnPacketEncode is called immediately before a packet is encoded to be sent to a client.
@@ -841,6 +854,10 @@ func (h *HookBase) OnDisconnect(cl *Client, err error, expire bool) {}
 // OnAuthPacket is called when an auth packet is received from the client.
 func (h *HookBase) OnAuthPacket(cl *Client, pk packets.Packet) (packets.Packet, error) {
 	return pk, nil
+}
+
+// OnAuthStateChange is called when the enhanced authentication state changes.
+func (h *HookBase) OnAuthStateChange(cl *Client, state AuthState, method string, reason packets.Code) {
 }
 
 // OnPacketRead is called when a packet is received.

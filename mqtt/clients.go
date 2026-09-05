@@ -33,6 +33,46 @@ const (
 	InheritWayRemote
 )
 
+// AuthState tracks the MQTT v5 enhanced authentication state of a client
+// as part of the connection lifecycle (MQTT v5.0 §4.12 Enhanced Authentication).
+type AuthState uint32
+
+const (
+	// AuthStateNone means no enhanced authentication is in use for the connection
+	// (plain MQTT v5 without Authentication Method, or MQTT v3).
+	AuthStateNone AuthState = iota
+	// AuthStatePending means the initial enhanced authentication handshake is in
+	// progress (CONNECT with Authentication Method received, CONNACK not yet sent).
+	// Only AUTH and DISCONNECT packets are legal in this state.
+	AuthStatePending
+	// AuthStateReAuthenticating means a re-authentication exchange (AUTH 0x19)
+	// is in progress on an otherwise fully established session.
+	AuthStateReAuthenticating
+	// AuthStateAuthenticated means enhanced authentication completed successfully;
+	// normal business packets are allowed.
+	AuthStateAuthenticated
+	// AuthStateFailed is the terminal state after an authentication failure or
+	// protocol violation during an enhanced authentication exchange.
+	AuthStateFailed
+)
+
+// String returns the human readable name of the authentication state, used by
+// logs, hooks and the management/observation plane.
+func (s AuthState) String() string {
+	switch s {
+	case AuthStatePending:
+		return "pending"
+	case AuthStateReAuthenticating:
+		return "reauthenticating"
+	case AuthStateAuthenticated:
+		return "authenticated"
+	case AuthStateFailed:
+		return "failed"
+	default:
+		return "none"
+	}
+}
+
 // ReadFn is the function signature for the function used for reading and processing new packets.
 type ReadFn func(*Client, packets.Packet) error
 
@@ -121,6 +161,40 @@ type Client struct {
 func (cl *Client) BytesRecv() int64 { return cl.bytesRecv.Load() }
 func (cl *Client) BytesSent() int64 { return cl.bytesSent.Load() }
 
+// AuthState returns the current MQTT v5 enhanced authentication state of the
+// connection (none/pending/reauthenticating/authenticated/failed).
+func (cl *Client) AuthState() AuthState {
+	return AuthState(cl.State.authState.Load())
+}
+
+// AuthenticationMethod returns the Authentication Method declared by the client
+// in CONNECT when enhanced authentication is used; empty for plain connections.
+func (cl *Client) AuthenticationMethod() string {
+	cl.RLock()
+	defer cl.RUnlock()
+	return cl.State.authMethod
+}
+
+// setAuthMethod records the Authentication Method of the enhanced authentication
+// exchange. It is written once per connection, on the connection packet goroutine.
+func (cl *Client) setAuthMethod(method string) {
+	cl.Lock()
+	defer cl.Unlock()
+	cl.State.authMethod = method
+}
+
+// casAuthState atomically transitions the enhanced authentication state from
+// `from` to `to`. It returns false if the current state is not `from`, ensuring
+// duplicate or concurrent AUTH packets can never advance the state machine twice.
+func (cl *Client) casAuthState(from, to AuthState) bool {
+	return cl.State.authState.CompareAndSwap(uint32(from), uint32(to))
+}
+
+// storeAuthState unconditionally sets the enhanced authentication state.
+func (cl *Client) storeAuthState(to AuthState) {
+	cl.State.authState.Store(uint32(to))
+}
+
 // ClientConnection contains the connection transport and metadata for the client.
 type ClientConnection struct {
 	Conn     net.Conn          // the net.Conn used to establish the connection
@@ -166,6 +240,8 @@ type ClientState struct {
 	outboundQty     int32                // number of messages currently in the outbound queue
 	Keepalive       uint16               // the number of seconds the connection can wait
 	ServerKeepalive bool                 // keepalive was set by the server
+	authState       atomic.Uint32        // MQTT v5 enhanced authentication state (AuthState), see §4.12
+	authMethod      string               // Authentication Method declared in CONNECT for enhanced auth
 }
 
 // newClient returns a new instance of Client. This is almost exclusively used by Server

@@ -3030,12 +3030,19 @@ func TestServerProcessPacketDisconnectNonZeroExpiryViolation(t *testing.T) {
 }
 
 func TestServerProcessPacketAuth(t *testing.T) {
+	// MQTT v5.0 §4.12: an AUTH packet is only legal inside an enhanced
+	// authentication lifecycle (CONNECT declared an Authentication Method and
+	// a hook is participating). This client never entered enhanced
+	// authentication, so the AUTH packet is a protocol error; processPacket
+	// emits nothing itself (receivePacket sends the DISCONNECT).
 	s := newServer()
 	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
 
 	go func() {
 		err := s.processPacket(cl, *packets.TPacketData[packets.Auth].Get(packets.TAuth).Packet)
-		require.NoError(t, err)
+		require.Error(t, err)
+		require.ErrorIs(t, err, packets.ErrProtocolViolation)
 		_ = w.Close()
 	}()
 
@@ -3055,17 +3062,29 @@ func TestServerProcessPacketAuthInvalidReason(t *testing.T) {
 }
 
 func TestServerProcessPacketAuthFailure(t *testing.T) {
+	// MQTT v5.0 §4.12.2: during re-authentication a hook error must settle the
+	// client into the failed state and surface a deterministic reason code.
 	s := newServer()
 	cl, _, _ := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	cl.setAuthMethod("SHA-1")
+	cl.storeAuthState(AuthStateAuthenticated)
+	require.True(t, cl.casAuthState(AuthStateAuthenticated, AuthStateReAuthenticating))
 
 	hook := new(modifiedHookBase)
 	hook.fail = true
-	err := s.AddHook(hook, nil)
-	require.NoError(t, err)
+	hook.err = packets.ErrNotAuthorized
+	require.NoError(t, s.AddHook(hook, nil))
 
-	err = s.processAuth(cl, *packets.TPacketData[packets.Auth].Get(packets.TAuth).Packet)
+	pk := *packets.TPacketData[packets.Auth].Get(packets.TAuth).Packet
+	pk.ReasonCode = packets.CodeContinueAuthentication.Code // continuation of re-auth
+	pk.Properties.AuthenticationMethod = "SHA-1"
+
+	err := s.processAuth(cl, pk)
 	require.Error(t, err)
-	require.ErrorIs(t, errTestHook, err)
+	require.ErrorIs(t, err, packets.ErrNotAuthorized)
+	require.Equal(t, AuthStateFailed, cl.AuthState())
+	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.EnhancedAuthFailed))
 }
 
 func TestServerSendLWT(t *testing.T) {
