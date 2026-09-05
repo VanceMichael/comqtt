@@ -7,6 +7,7 @@ package mqtt
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -4111,6 +4112,245 @@ func TestConvertMessageMapToSlice(t *testing.T) {
 
 	result := s.convertMessageMapToSlice(messageMap)
 	require.Len(t, result, 3)
+}
+
+// sessionStoreHook is a test hook emulating per-client persistent records
+// (like the clustered redis store): it provides client-record, subscriptions
+// and inflight message lookups by client id and records expiry callbacks.
+type sessionStoreHook struct {
+	HookBase
+	clients   map[string]storage.Client
+	subs      map[string][]storage.Subscription
+	inflight  map[string][]storage.Message
+	clientErr error
+	subsErr   error
+	ifmErr    error
+	expired   []string
+}
+
+func (h *sessionStoreHook) ID() string { return "session-store" }
+
+func (h *sessionStoreHook) Provides(b byte) bool {
+	switch b {
+	case StoredClientByCid, StoredSubscriptionsByCid, StoredInflightMessagesByCid, OnClientExpired:
+		return true
+	}
+	return false
+}
+
+func (h *sessionStoreHook) StoredClientByCid(cid string) (storage.Client, error) {
+	if h.clientErr != nil {
+		return storage.Client{}, h.clientErr
+	}
+	return h.clients[cid], nil
+}
+
+func (h *sessionStoreHook) StoredSubscriptionsByCid(cid string) ([]storage.Subscription, error) {
+	if h.subsErr != nil {
+		return nil, h.subsErr
+	}
+	return h.subs[cid], nil
+}
+
+func (h *sessionStoreHook) StoredInflightMessagesByCid(cid string) ([]storage.Message, error) {
+	if h.ifmErr != nil {
+		return nil, h.ifmErr
+	}
+	return h.inflight[cid], nil
+}
+
+func (h *sessionStoreHook) OnClientExpired(cl *Client) {
+	h.expired = append(h.expired, cl.ID)
+}
+
+// TestLoadClientsSessionLease verifies that the session lease (disconnect moment
+// and absolute expiry deadline) is reconstructed when clients are restored from
+// the store, including the fallback for records without a persisted lease.
+func TestLoadClientsSessionLease(t *testing.T) {
+	s := newServer()
+	now := time.Now().Unix()
+
+	v := []storage.Client{
+		{ID: "with-lease", DisconnectedAt: now - 10, ExpiresAt: now + 50},
+		{ID: "no-lease", ProtocolVersion: 5, Properties: storage.ClientProperties{
+			SessionExpiryInterval:     100,
+			SessionExpiryIntervalFlag: true,
+		}},
+	}
+	s.loadClients(v, now-20)
+
+	c1, ok := s.Clients.Get("with-lease")
+	require.True(t, ok)
+	require.Equal(t, now-10, c1.DisconnectedAt())
+	require.Equal(t, now+50, c1.SessionExpiresAt())
+	require.False(t, s.sessionLeaseExpired(c1, now))
+	require.True(t, s.sessionLeaseExpired(c1, now+51))
+
+	c2, ok := s.Clients.Get("no-lease")
+	require.True(t, ok)
+	require.Equal(t, now-20, c2.DisconnectedAt()) // anchored to the last-known-alive time
+	require.Equal(t, now-20+100, c2.SessionExpiresAt())
+	require.False(t, s.sessionLeaseExpired(c2, now))
+	require.True(t, s.sessionLeaseExpired(c2, now+200))
+}
+
+// TestClearExpiredClientsSessionCascade verifies that expiring a session removes
+// its subscriptions from the topic trie, its inflight messages, the in-memory
+// client and invokes the OnClientExpired hook so storage records can be removed.
+func TestClearExpiredClientsSessionCascade(t *testing.T) {
+	s := newServer()
+	hook := new(sessionStoreHook)
+	hook.clients = map[string]storage.Client{}
+	require.NoError(t, s.AddHook(hook, nil))
+
+	now := time.Now().Unix()
+
+	cl, _, _ := newTestClient()
+	cl.ID = "expired"
+	cl.Net.Conn = nil
+	cl.Properties.ProtocolVersion = 5
+	cl.State.disconnected = now - 10
+	cl.State.expiresAt = now - 1
+	sub := packets.Subscription{Filter: "a/b/c", Qos: 1}
+	cl.State.Subscriptions.Add("a/b/c", sub)
+	s.Topics.Subscribe(cl.ID, sub)
+	cl.State.Inflight.Set(packets.Packet{PacketID: 3, TopicName: "a/b/c"})
+	s.Clients.Add(cl)
+
+	require.Equal(t, 1, len(s.Topics.Subscribers("a/b/c").Subscriptions))
+
+	s.clearExpiredClients(now)
+
+	_, ok := s.Clients.Get("expired")
+	require.False(t, ok)
+	require.Equal(t, 0, len(s.Topics.Subscribers("a/b/c").Subscriptions))
+	require.Equal(t, []string{"expired"}, hook.expired)
+}
+
+// TestInheritClientSessionExpiredLease verifies that an offline session whose
+// lease has elapsed is not inherited on reconnect: the old state is purged and
+// the broker reports no existing session. Unexpired leases are inherited.
+func TestInheritClientSessionExpiredLease(t *testing.T) {
+	s := newServer()
+	hook := new(sessionStoreHook)
+	require.NoError(t, s.AddHook(hook, nil))
+
+	now := time.Now().Unix()
+
+	placeholder, _, _ := newTestClient()
+	placeholder.Net.Conn = nil
+	placeholder.ID = "cid"
+	placeholder.Properties.ProtocolVersion = 5
+	placeholder.State.disconnected = now - 100
+	placeholder.State.expiresAt = now - 1
+	sub := packets.Subscription{Filter: "a/b/c", Qos: 1}
+	placeholder.State.Subscriptions.Add("a/b/c", sub)
+	s.Topics.Subscribe(placeholder.ID, sub)
+	placeholder.State.Inflight.Set(packets.Packet{PacketID: 9, TopicName: "a/b/c"})
+	s.Clients.Add(placeholder)
+
+	cl, _, _ := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+
+	present := s.inheritClientSession(packets.Packet{Connect: packets.ConnectParams{ClientIdentifier: "cid"}}, cl)
+	require.False(t, present)
+	_, ok := s.Clients.Get("cid") // purged; the new client is added by the caller
+	require.False(t, ok)
+	require.Equal(t, 0, cl.State.Inflight.Len())
+	require.Equal(t, 0, len(s.Topics.Subscribers("a/b/c").Subscriptions))
+	require.Equal(t, []string{"cid"}, hook.expired)
+
+	// Unexpired restored placeholder is inherited with subs and inflight.
+	placeholder2, _, _ := newTestClient()
+	placeholder2.Net.Conn = nil
+	placeholder2.ID = "cid2"
+	placeholder2.Properties.ProtocolVersion = 5
+	placeholder2.State.disconnected = now - 1
+	placeholder2.State.expiresAt = now + 100
+	placeholder2.State.Subscriptions.Add("a/b/c", sub)
+	s.Topics.Subscribe(placeholder2.ID, sub)
+	placeholder2.State.Inflight.Set(packets.Packet{PacketID: 8, TopicName: "a/b/c"})
+	s.Clients.Add(placeholder2)
+
+	cl2, _, _ := newTestClient()
+	cl2.Properties.ProtocolVersion = 5
+	present = s.inheritClientSession(packets.Packet{Connect: packets.ConnectParams{ClientIdentifier: "cid2"}}, cl2)
+	require.True(t, present)
+	require.Equal(t, 1, cl2.State.Subscriptions.Len())
+	require.Equal(t, 1, cl2.State.Inflight.Len())
+}
+
+// TestRestoreClientSessionLease verifies remote (store-backed) session restore:
+// expired persisted sessions are purged and reported absent, live sessions are
+// restored with subscriptions and inflight messages attached, and a failure to
+// read one kind of record is tolerated as long as the client record proves the
+// session is still within its lease.
+func TestRestoreClientSessionLease(t *testing.T) {
+	now := time.Now().Unix()
+
+	// Expired persisted session: purged, session present=false.
+	s := newServer()
+	hook := new(sessionStoreHook)
+	hook.clients = map[string]storage.Client{
+		"gone": {ID: "gone", ExpiresAt: now - 1},
+	}
+	hook.subs = map[string][]storage.Subscription{
+		"gone": {{ID: "gone:a/b/c", Client: "gone", Filter: "a/b/c", Qos: 1}},
+	}
+	hook.inflight = map[string][]storage.Message{
+		"gone": {{Origin: "gone", PacketID: 5, TopicName: "a/b/c"}},
+	}
+	require.NoError(t, s.AddHook(hook, nil))
+
+	cl, _, _ := newTestClient()
+	cl.ID = "gone"
+	require.False(t, s.restoreClientSession(cl))
+	require.Equal(t, []string{"gone"}, hook.expired)
+	require.Equal(t, 0, cl.State.Subscriptions.Len())
+	require.Equal(t, 0, cl.State.Inflight.Len())
+
+	// Live persisted session: state restored onto the new client.
+	s = newServer()
+	hook = new(sessionStoreHook)
+	hook.clients = map[string]storage.Client{
+		"live": {ID: "live", ExpiresAt: now + 100},
+	}
+	hook.subs = map[string][]storage.Subscription{
+		"live": {{ID: "live:a/b/c", Client: "live", Filter: "a/b/c", Qos: 1}},
+	}
+	hook.inflight = map[string][]storage.Message{
+		"live": {{Origin: "live", PacketID: 6, TopicName: "a/b/c", FixedHeader: packets.FixedHeader{Type: packets.Publish}}},
+	}
+	require.NoError(t, s.AddHook(hook, nil))
+
+	cl, _, _ = newTestClient()
+	cl.ID = "live"
+	require.True(t, s.restoreClientSession(cl))
+	require.Equal(t, 1, cl.State.Subscriptions.Len())
+	msg, ok := cl.State.Inflight.Get(6)
+	require.True(t, ok)
+	require.Equal(t, "a/b/c", msg.TopicName)
+	require.Equal(t, 1, len(s.Topics.Subscribers("a/b/c").Subscriptions))
+	require.Empty(t, hook.expired)
+
+	// Subscription read fails: the live client record still proves the session
+	// exists, so the connection is treated as session present and inflight
+	// delivery is restored best-effort.
+	s = newServer()
+	hook = new(sessionStoreHook)
+	hook.clients = map[string]storage.Client{
+		"live2": {ID: "live2", ExpiresAt: now + 100},
+	}
+	hook.subsErr = errors.New("boom")
+	hook.inflight = map[string][]storage.Message{
+		"live2": {{Origin: "live2", PacketID: 7, TopicName: "d/e/f"}},
+	}
+	require.NoError(t, s.AddHook(hook, nil))
+
+	cl, _, _ = newTestClient()
+	cl.ID = "live2"
+	require.True(t, s.restoreClientSession(cl))
+	require.Equal(t, 1, cl.State.Inflight.Len())
 }
 
 // TestSendRetainedMessagesToClient tests the sendRetainedMessagesToClient helper function

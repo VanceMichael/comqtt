@@ -90,6 +90,9 @@ func (s *Storage) Provides(b byte) bool {
 		mqtt.StoredRetainedMessages,
 		mqtt.StoredSubscriptions,
 		mqtt.StoredSysInfo,
+		mqtt.StoredClientByCid,
+		mqtt.StoredSubscriptionsByCid,
+		mqtt.StoredInflightMessagesByCid,
 	}, []byte{b})
 }
 
@@ -170,6 +173,8 @@ func (s *Storage) updateClient(cl *mqtt.Client) {
 		Username:        cl.Properties.Username,
 		Clean:           cl.Properties.Clean,
 		ProtocolVersion: cl.Properties.ProtocolVersion,
+		DisconnectedAt:  cl.DisconnectedAt(),
+		ExpiresAt:       cl.SessionExpiresAt(),
 		Properties: storage.ClientProperties{
 			SessionExpiryInterval: props.SessionExpiryInterval,
 			AuthenticationMethod:  props.AuthenticationMethod,
@@ -191,13 +196,22 @@ func (s *Storage) updateClient(cl *mqtt.Client) {
 }
 
 // OnDisconnect removes a client from the store if they were using a clean session.
+// For persistent sessions the client record is rewritten with the session lease
+// fixed at disconnect time, so that expiry keeps counting across broker restarts.
 func (s *Storage) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 	if s.db == nil {
 		s.Log.Error("", "error", storage.ErrDBFileNotOpen)
 		return
 	}
 
+	// A taken-over session continues under the new connection: do not overwrite
+	// its records with the old connection's lease or delete them.
+	if cl.StopCause() == packets.ErrSessionTakenOver {
+		return
+	}
+
 	if !expire {
+		s.updateClient(cl)
 		return
 	}
 
@@ -375,16 +389,27 @@ func (s *Storage) OnRetainedExpired(filter string) {
 	}
 }
 
-// OnClientExpired deleted expired clients from the store.
+// OnClientExpired deletes an expired client and all its subscriptions and
+// inflight messages from the store, so that no record of the expired session
+// can reappear on reconnect or after a node restart. Subscriptions and
+// inflight messages are kept in per-client hash keys, so a single DEL each
+// removes the whole session state.
 func (s *Storage) OnClientExpired(cl *mqtt.Client) {
 	if s.db == nil {
 		s.Log.Error("", "error", storage.ErrDBFileNotOpen)
 		return
 	}
 
-	err := s.db.HDel(s.ctx, s.hKey(storage.ClientKey), clientKey(cl)).Err()
-	if err != nil {
-		s.Log.Error("failed to delete expired client", "error", err, "id", clientKey(cl))
+	id := clientKey(cl)
+
+	if err := s.db.Del(s.ctx, s.hKey(utils.JoinStrings(storage.SubscriptionKey, id))).Err(); err != nil {
+		s.Log.Error("failed to delete expired client subscriptions", "error", err, "id", id)
+	}
+	if err := s.db.Del(s.ctx, s.hKey(utils.JoinStrings(storage.InflightKey, id))).Err(); err != nil {
+		s.Log.Error("failed to delete expired client inflight messages", "error", err, "id", id)
+	}
+	if err := s.db.HDel(s.ctx, s.hKey(storage.ClientKey), id).Err(); err != nil {
+		s.Log.Error("failed to delete expired client", "error", err, "id", id)
 	}
 }
 

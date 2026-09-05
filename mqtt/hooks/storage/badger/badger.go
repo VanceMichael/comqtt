@@ -149,6 +149,8 @@ func (h *Hook) updateClient(cl *mqtt.Client) {
 		Username:        cl.Properties.Username,
 		Clean:           cl.Properties.Clean,
 		ProtocolVersion: cl.Properties.ProtocolVersion,
+		DisconnectedAt:  cl.DisconnectedAt(),
+		ExpiresAt:       cl.SessionExpiresAt(),
 		Properties: storage.ClientProperties{
 			SessionExpiryInterval: props.SessionExpiryInterval,
 			AuthenticationMethod:  props.AuthenticationMethod,
@@ -170,19 +172,22 @@ func (h *Hook) updateClient(cl *mqtt.Client) {
 }
 
 // OnDisconnect removes a client from the store if their session has expired.
+// For persistent sessions the client record is rewritten with the session lease
+// fixed at disconnect time, so that expiry keeps counting across broker restarts.
 func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 	if h.db == nil {
 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
 		return
 	}
 
-	h.updateClient(cl)
-
-	if !expire {
+	// A taken-over session continues under the new connection: do not overwrite
+	// its records with the old connection's lease or delete them.
+	if cl.StopCause() == packets.ErrSessionTakenOver {
 		return
 	}
 
-	if cl.StopCause() == packets.ErrSessionTakenOver {
+	if !expire {
+		h.updateClient(cl)
 		return
 	}
 
@@ -370,16 +375,40 @@ func (h *Hook) OnRetainedExpired(filter string) {
 	}
 }
 
-// OnClientExpired deleted expired clients from the store.
+// OnClientExpired deletes an expired client and all its subscriptions and
+// inflight messages from the store, so that no record of the expired session
+// can reappear on reconnect or after a broker restart.
 func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 	if h.db == nil {
 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
 		return
 	}
 
-	err := h.db.Delete(clientKey(cl), new(storage.Client))
-	if err != nil {
-		h.Log.Error("failed to delete expired client data", "error", err, "id", clientKey(cl))
+	id := clientKey(cl)
+	if err := h.db.Delete(id, new(storage.Client)); err != nil {
+		h.Log.Error("failed to delete expired client data", "error", err, "id", id)
+	}
+
+	var subs []storage.Subscription
+	err := h.db.Find(&subs, badgerhold.Where("T").Eq(storage.SubscriptionKey).And("Client").Eq(id))
+	if err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
+		h.Log.Error("failed to find subscriptions of expired client", "error", err, "id", id)
+	}
+	for i := range subs {
+		if err = h.db.Delete(subs[i].ID, new(storage.Subscription)); err != nil {
+			h.Log.Error("failed to delete subscription of expired client", "error", err, "id", subs[i].ID)
+		}
+	}
+
+	var msgs []storage.Message
+	err = h.db.Find(&msgs, badgerhold.Where("T").Eq(storage.InflightKey).And("Origin").Eq(id))
+	if err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
+		h.Log.Error("failed to find inflight messages of expired client", "error", err, "id", id)
+	}
+	for i := range msgs {
+		if err = h.db.Delete(msgs[i].ID, new(storage.Message)); err != nil {
+			h.Log.Error("failed to delete inflight message of expired client", "error", err, "id", msgs[i].ID)
+		}
 	}
 }
 

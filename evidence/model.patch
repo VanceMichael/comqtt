@@ -1,0 +1,1199 @@
+diff --git a/cluster/storage/redis/redis.go b/cluster/storage/redis/redis.go
+index 12db6b2..8fa1125 100644
+--- a/cluster/storage/redis/redis.go
++++ b/cluster/storage/redis/redis.go
+@@ -90,6 +90,9 @@ func (s *Storage) Provides(b byte) bool {
+ 		mqtt.StoredRetainedMessages,
+ 		mqtt.StoredSubscriptions,
+ 		mqtt.StoredSysInfo,
++		mqtt.StoredClientByCid,
++		mqtt.StoredSubscriptionsByCid,
++		mqtt.StoredInflightMessagesByCid,
+ 	}, []byte{b})
+ }
+ 
+@@ -170,6 +173,8 @@ func (s *Storage) updateClient(cl *mqtt.Client) {
+ 		Username:        cl.Properties.Username,
+ 		Clean:           cl.Properties.Clean,
+ 		ProtocolVersion: cl.Properties.ProtocolVersion,
++		DisconnectedAt:  cl.DisconnectedAt(),
++		ExpiresAt:       cl.SessionExpiresAt(),
+ 		Properties: storage.ClientProperties{
+ 			SessionExpiryInterval: props.SessionExpiryInterval,
+ 			AuthenticationMethod:  props.AuthenticationMethod,
+@@ -191,13 +196,22 @@ func (s *Storage) updateClient(cl *mqtt.Client) {
+ }
+ 
+ // OnDisconnect removes a client from the store if they were using a clean session.
++// For persistent sessions the client record is rewritten with the session lease
++// fixed at disconnect time, so that expiry keeps counting across broker restarts.
+ func (s *Storage) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
+ 	if s.db == nil {
+ 		s.Log.Error("", "error", storage.ErrDBFileNotOpen)
+ 		return
+ 	}
+ 
++	// A taken-over session continues under the new connection: do not overwrite
++	// its records with the old connection's lease or delete them.
++	if cl.StopCause() == packets.ErrSessionTakenOver {
++		return
++	}
++
+ 	if !expire {
++		s.updateClient(cl)
+ 		return
+ 	}
+ 
+@@ -375,16 +389,27 @@ func (s *Storage) OnRetainedExpired(filter string) {
+ 	}
+ }
+ 
+-// OnClientExpired deleted expired clients from the store.
++// OnClientExpired deletes an expired client and all its subscriptions and
++// inflight messages from the store, so that no record of the expired session
++// can reappear on reconnect or after a node restart. Subscriptions and
++// inflight messages are kept in per-client hash keys, so a single DEL each
++// removes the whole session state.
+ func (s *Storage) OnClientExpired(cl *mqtt.Client) {
+ 	if s.db == nil {
+ 		s.Log.Error("", "error", storage.ErrDBFileNotOpen)
+ 		return
+ 	}
+ 
+-	err := s.db.HDel(s.ctx, s.hKey(storage.ClientKey), clientKey(cl)).Err()
+-	if err != nil {
+-		s.Log.Error("failed to delete expired client", "error", err, "id", clientKey(cl))
++	id := clientKey(cl)
++
++	if err := s.db.Del(s.ctx, s.hKey(utils.JoinStrings(storage.SubscriptionKey, id))).Err(); err != nil {
++		s.Log.Error("failed to delete expired client subscriptions", "error", err, "id", id)
++	}
++	if err := s.db.Del(s.ctx, s.hKey(utils.JoinStrings(storage.InflightKey, id))).Err(); err != nil {
++		s.Log.Error("failed to delete expired client inflight messages", "error", err, "id", id)
++	}
++	if err := s.db.HDel(s.ctx, s.hKey(storage.ClientKey), id).Err(); err != nil {
++		s.Log.Error("failed to delete expired client", "error", err, "id", id)
+ 	}
+ }
+ 
+diff --git a/cluster/storage/redis/redis_test.go b/cluster/storage/redis/redis_test.go
+index 8cf6ae5..fcb85ae 100644
+--- a/cluster/storage/redis/redis_test.go
++++ b/cluster/storage/redis/redis_test.go
+@@ -109,6 +109,9 @@ func TestProvides(t *testing.T) {
+ 	require.True(t, s.Provides(mqtt.StoredRetainedMessages))
+ 	require.True(t, s.Provides(mqtt.StoredSubscriptions))
+ 	require.True(t, s.Provides(mqtt.StoredSysInfo))
++	require.True(t, s.Provides(mqtt.StoredClientByCid))
++	require.True(t, s.Provides(mqtt.StoredSubscriptionsByCid))
++	require.True(t, s.Provides(mqtt.StoredInflightMessagesByCid))
+ 	require.False(t, s.Provides(mqtt.OnACLCheck))
+ 	require.False(t, s.Provides(mqtt.OnConnectAuthenticate))
+ }
+@@ -254,6 +257,70 @@ func TestOnClientExpired(t *testing.T) {
+ 	require.ErrorIs(t, redis.Nil, err)
+ }
+ 
++// TestOnClientExpiredRemovesSessionState verifies that expiring a client removes
++// the client record together with its per-client subscription and inflight
++// hash keys, while records of other clients stay untouched.
++func TestOnClientExpiredRemovesSessionState(t *testing.T) {
++	m := miniredis.RunT(t)
++	defer m.Close()
++	s := newHook(t, m.Addr())
++	defer teardown(t, s)
++
++	require.NoError(t, s.db.HSet(s.ctx, s.hKey(storage.ClientKey), "cl1", &storage.Client{ID: "cl1"}).Err())
++	require.NoError(t, s.db.HSet(s.ctx, s.hKey(utils.JoinStrings(storage.SubscriptionKey, "cl1")), "a/b", &storage.Subscription{Filter: "a/b"}).Err())
++	require.NoError(t, s.db.HSet(s.ctx, s.hKey(utils.JoinStrings(storage.InflightKey, "cl1")), "1", &storage.Message{Origin: "cl1", PacketID: 1}).Err())
++	require.NoError(t, s.db.HSet(s.ctx, s.hKey(utils.JoinStrings(storage.SubscriptionKey, "cl2")), "c/d", &storage.Subscription{Filter: "c/d"}).Err())
++
++	s.OnClientExpired(&mqtt.Client{ID: "cl1"})
++
++	n, err := s.db.Exists(s.ctx, s.hKey(utils.JoinStrings(storage.SubscriptionKey, "cl1"))).Result()
++	require.NoError(t, err)
++	require.Equal(t, int64(0), n)
++	n, err = s.db.Exists(s.ctx, s.hKey(utils.JoinStrings(storage.InflightKey, "cl1"))).Result()
++	require.NoError(t, err)
++	require.Equal(t, int64(0), n)
++	_, err = s.db.HGet(s.ctx, s.hKey(storage.ClientKey), "cl1").Result()
++	require.ErrorIs(t, err, redis.Nil)
++
++	// other clients' records must survive
++	n, err = s.db.Exists(s.ctx, s.hKey(utils.JoinStrings(storage.SubscriptionKey, "cl2"))).Result()
++	require.NoError(t, err)
++	require.Equal(t, int64(1), n)
++}
++
++// TestOnDisconnectPersistsSessionLease verifies that a persistent disconnect
++// rewrites the client record with the lease fixed at disconnect time, while a
++// taken-over session leaves the (online) record untouched.
++func TestOnDisconnectPersistsSessionLease(t *testing.T) {
++	m := miniredis.RunT(t)
++	defer m.Close()
++	s := newHook(t, m.Addr())
++	defer teardown(t, s)
++
++	cl := &mqtt.Client{ID: "lease", Net: mqtt.ClientConnection{Remote: "r", Listener: "l"}}
++	s.OnSessionEstablished(cl, packets.Packet{})
++	cl.Stop(nil)
++	s.OnDisconnect(cl, nil, false)
++
++	row, err := s.db.HGet(s.ctx, s.hKey(storage.ClientKey), "lease").Result()
++	require.NoError(t, err)
++	r := new(storage.Client)
++	require.NoError(t, r.UnmarshalBinary([]byte(row)))
++	require.Equal(t, cl.DisconnectedAt(), r.DisconnectedAt)
++	require.Greater(t, r.DisconnectedAt, int64(0))
++
++	// taken-over connection: record must not be overwritten with a stale lease
++	taken := &mqtt.Client{ID: "take", Net: mqtt.ClientConnection{Remote: "r", Listener: "l"}}
++	s.OnSessionEstablished(taken, packets.Packet{})
++	taken.Stop(packets.ErrSessionTakenOver)
++	s.OnDisconnect(taken, nil, false)
++	row, err = s.db.HGet(s.ctx, s.hKey(storage.ClientKey), "take").Result()
++	require.NoError(t, err)
++	r2 := new(storage.Client)
++	require.NoError(t, r2.UnmarshalBinary([]byte(row)))
++	require.Equal(t, int64(0), r2.DisconnectedAt, "taken-over session keeps its online record")
++}
++
+ func TestOnClientExpiredClosedDB(t *testing.T) {
+ 	m := miniredis.RunT(t)
+ 	defer m.Close()
+diff --git a/mqtt/clients.go b/mqtt/clients.go
+index b47b68a..9082fdb 100644
+--- a/mqtt/clients.go
++++ b/mqtt/clients.go
+@@ -157,6 +157,7 @@ type ClientState struct {
+ 	Inflight        *Inflight            // a map of in-flight qos messages
+ 	Subscriptions   *Subscriptions       // a map of the subscription filters a client maintains
+ 	disconnected    int64                // the time the client disconnected in unix time, for calculating expiry
++	expiresAt       int64                // the absolute unix deadline of the session lease, computed at disconnect time
+ 	outbound        chan *packets.Packet // queue for pending outbound packets
+ 	endOnce         sync.Once            // only end once
+ 	isTakenOver     uint32               // used to identify orphaned clients
+@@ -400,10 +401,51 @@ func (cl *Client) Stop(err error) {
+ 			cl.State.cancelOpen()
+ 		}
+ 
+-		atomic.StoreInt64(&cl.State.disconnected, time.Now().Unix())
++		// Record the session lease as of the disconnect moment so that expiry keeps
++		// counting from this exact time, even if the broker is restarted before the
++		// lease elapses.
++		now := time.Now().Unix()
++		atomic.StoreInt64(&cl.State.disconnected, now)
++		atomic.StoreInt64(&cl.State.expiresAt, cl.sessionExpiresAt(now))
+ 	})
+ }
+ 
++// DisconnectedAt returns the unix time the client connection went down, or zero
++// while the client is connected.
++func (cl *Client) DisconnectedAt() int64 {
++	return atomic.LoadInt64(&cl.State.disconnected)
++}
++
++// SessionExpiresAt returns the absolute unix deadline of the session lease that was
++// determined when the client disconnected. It is zero for connected clients and for
++// sessions without a persistent lease (clean sessions / mqtt v5 expiry interval 0).
++func (cl *Client) SessionExpiresAt() int64 {
++	return atomic.LoadInt64(&cl.State.expiresAt)
++}
++
++// sessionExpiresAt computes the absolute session lease deadline for a disconnection
++// happening at now. The lease uses the session expiry interval in effect at disconnect
++// time: the CONNECT value, possibly updated by a DISCONNECT packet for mqtt v5, or the
++// server maximum session expiry interval for mqtt v3 persistent sessions. A zero
++// interval means the session state must be discarded on disconnect, so no lease is
++// recorded.
++func (cl *Client) sessionExpiresAt(now int64) int64 {
++	if cl.ops == nil || cl.ops.options == nil || cl.ops.options.Capabilities == nil {
++		return 0
++	}
++
++	interval := int64(cl.ops.options.Capabilities.MaximumSessionExpiryInterval)
++	if cl.Properties.ProtocolVersion == 5 {
++		interval = int64(cl.Properties.Props.SessionExpiryInterval)
++	}
++
++	if interval <= 0 {
++		return 0
++	}
++
++	return now + interval
++}
++
+ // StopCause returns the reason the client connection was stopped, if any.
+ func (cl *Client) StopCause() error {
+ 	if cl.State.stopCause.Load() == nil {
+diff --git a/mqtt/hooks/storage/badger/badger.go b/mqtt/hooks/storage/badger/badger.go
+index f714d62..5476d19 100644
+--- a/mqtt/hooks/storage/badger/badger.go
++++ b/mqtt/hooks/storage/badger/badger.go
+@@ -149,6 +149,8 @@ func (h *Hook) updateClient(cl *mqtt.Client) {
+ 		Username:        cl.Properties.Username,
+ 		Clean:           cl.Properties.Clean,
+ 		ProtocolVersion: cl.Properties.ProtocolVersion,
++		DisconnectedAt:  cl.DisconnectedAt(),
++		ExpiresAt:       cl.SessionExpiresAt(),
+ 		Properties: storage.ClientProperties{
+ 			SessionExpiryInterval: props.SessionExpiryInterval,
+ 			AuthenticationMethod:  props.AuthenticationMethod,
+@@ -170,19 +172,22 @@ func (h *Hook) updateClient(cl *mqtt.Client) {
+ }
+ 
+ // OnDisconnect removes a client from the store if their session has expired.
++// For persistent sessions the client record is rewritten with the session lease
++// fixed at disconnect time, so that expiry keeps counting across broker restarts.
+ func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
+ 	if h.db == nil {
+ 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
+ 		return
+ 	}
+ 
+-	h.updateClient(cl)
+-
+-	if !expire {
++	// A taken-over session continues under the new connection: do not overwrite
++	// its records with the old connection's lease or delete them.
++	if cl.StopCause() == packets.ErrSessionTakenOver {
+ 		return
+ 	}
+ 
+-	if cl.StopCause() == packets.ErrSessionTakenOver {
++	if !expire {
++		h.updateClient(cl)
+ 		return
+ 	}
+ 
+@@ -370,16 +375,40 @@ func (h *Hook) OnRetainedExpired(filter string) {
+ 	}
+ }
+ 
+-// OnClientExpired deleted expired clients from the store.
++// OnClientExpired deletes an expired client and all its subscriptions and
++// inflight messages from the store, so that no record of the expired session
++// can reappear on reconnect or after a broker restart.
+ func (h *Hook) OnClientExpired(cl *mqtt.Client) {
+ 	if h.db == nil {
+ 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
+ 		return
+ 	}
+ 
+-	err := h.db.Delete(clientKey(cl), new(storage.Client))
+-	if err != nil {
+-		h.Log.Error("failed to delete expired client data", "error", err, "id", clientKey(cl))
++	id := clientKey(cl)
++	if err := h.db.Delete(id, new(storage.Client)); err != nil {
++		h.Log.Error("failed to delete expired client data", "error", err, "id", id)
++	}
++
++	var subs []storage.Subscription
++	err := h.db.Find(&subs, badgerhold.Where("T").Eq(storage.SubscriptionKey).And("Client").Eq(id))
++	if err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
++		h.Log.Error("failed to find subscriptions of expired client", "error", err, "id", id)
++	}
++	for i := range subs {
++		if err = h.db.Delete(subs[i].ID, new(storage.Subscription)); err != nil {
++			h.Log.Error("failed to delete subscription of expired client", "error", err, "id", subs[i].ID)
++		}
++	}
++
++	var msgs []storage.Message
++	err = h.db.Find(&msgs, badgerhold.Where("T").Eq(storage.InflightKey).And("Origin").Eq(id))
++	if err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
++		h.Log.Error("failed to find inflight messages of expired client", "error", err, "id", id)
++	}
++	for i := range msgs {
++		if err = h.db.Delete(msgs[i].ID, new(storage.Message)); err != nil {
++			h.Log.Error("failed to delete inflight message of expired client", "error", err, "id", msgs[i].ID)
++		}
+ 	}
+ }
+ 
+diff --git a/mqtt/hooks/storage/bolt/bolt.go b/mqtt/hooks/storage/bolt/bolt.go
+index 374e493..68c405d 100644
+--- a/mqtt/hooks/storage/bolt/bolt.go
++++ b/mqtt/hooks/storage/bolt/bolt.go
+@@ -17,6 +17,7 @@ import (
+ 
+ 	sgob "github.com/asdine/storm/codec/gob"
+ 	"github.com/asdine/storm/v3"
++	"github.com/asdine/storm/v3/q"
+ 	"go.etcd.io/bbolt"
+ )
+ 
+@@ -154,6 +155,8 @@ func (h *Hook) updateClient(cl *mqtt.Client) {
+ 		Username:        cl.Properties.Username,
+ 		Clean:           cl.Properties.Clean,
+ 		ProtocolVersion: cl.Properties.ProtocolVersion,
++		DisconnectedAt:  cl.DisconnectedAt(),
++		ExpiresAt:       cl.SessionExpiresAt(),
+ 		Properties: storage.ClientProperties{
+ 			SessionExpiryInterval: props.SessionExpiryInterval,
+ 			AuthenticationMethod:  props.AuthenticationMethod,
+@@ -174,17 +177,22 @@ func (h *Hook) updateClient(cl *mqtt.Client) {
+ }
+ 
+ // OnDisconnect removes a client from the store if they were using a clean session.
++// For persistent sessions the client record is rewritten with the session lease
++// fixed at disconnect time, so that expiry keeps counting across broker restarts.
+ func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
+ 	if h.db == nil {
+ 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
+ 		return
+ 	}
+ 
+-	if !expire {
++	// A taken-over session continues under the new connection: do not overwrite
++	// its records with the old connection's lease or delete them.
++	if cl.StopCause() == packets.ErrSessionTakenOver {
+ 		return
+ 	}
+ 
+-	if cl.StopCause() == packets.ErrSessionTakenOver {
++	if !expire {
++		h.updateClient(cl)
+ 		return
+ 	}
+ 
+@@ -374,16 +382,39 @@ func (h *Hook) OnRetainedExpired(filter string) {
+ 	}
+ }
+ 
+-// OnClientExpired deleted expired clients from the store.
++// OnClientExpired deletes an expired client and all its subscriptions and
++// inflight messages from the store, so that no record of the expired session
++// can reappear on reconnect or after a broker restart.
+ func (h *Hook) OnClientExpired(cl *mqtt.Client) {
+ 	if h.db == nil {
+ 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
+ 		return
+ 	}
+ 
+-	err := h.db.DeleteStruct(&storage.Client{ID: clientKey(cl)})
++	id := clientKey(cl)
++	err := h.db.DeleteStruct(&storage.Client{ID: id})
+ 	if err != nil && !errors.Is(err, storm.ErrNotFound) {
+-		h.Log.Error("failed to delete expired client", "error", err, "id", clientKey(cl))
++		h.Log.Error("failed to delete expired client", "error", err, "id", id)
++	}
++
++	var subs []storage.Subscription
++	if err = h.db.Select(q.Eq("T", storage.SubscriptionKey), q.Eq("Client", id)).Find(&subs); err != nil && !errors.Is(err, storm.ErrNotFound) {
++		h.Log.Error("failed to find subscriptions of expired client", "error", err, "id", id)
++	}
++	for i := range subs {
++		if err = h.db.DeleteStruct(&storage.Subscription{ID: subs[i].ID}); err != nil && !errors.Is(err, storm.ErrNotFound) {
++			h.Log.Error("failed to delete subscription of expired client", "error", err, "id", subs[i].ID)
++		}
++	}
++
++	var msgs []storage.Message
++	if err = h.db.Select(q.Eq("T", storage.InflightKey), q.Eq("Origin", id)).Find(&msgs); err != nil && !errors.Is(err, storm.ErrNotFound) {
++		h.Log.Error("failed to find inflight messages of expired client", "error", err, "id", id)
++	}
++	for i := range msgs {
++		if err = h.db.DeleteStruct(&storage.Message{ID: msgs[i].ID}); err != nil && !errors.Is(err, storm.ErrNotFound) {
++			h.Log.Error("failed to delete inflight message of expired client", "error", err, "id", msgs[i].ID)
++		}
+ 	}
+ }
+ 
+diff --git a/mqtt/hooks/storage/redis/redis.go b/mqtt/hooks/storage/redis/redis.go
+index 8104025..9a49c14 100644
+--- a/mqtt/hooks/storage/redis/redis.go
++++ b/mqtt/hooks/storage/redis/redis.go
+@@ -167,6 +167,8 @@ func (h *Hook) updateClient(cl *mqtt.Client) {
+ 		Username:        cl.Properties.Username,
+ 		Clean:           cl.Properties.Clean,
+ 		ProtocolVersion: cl.Properties.ProtocolVersion,
++		DisconnectedAt:  cl.DisconnectedAt(),
++		ExpiresAt:       cl.SessionExpiresAt(),
+ 		Properties: storage.ClientProperties{
+ 			SessionExpiryInterval: props.SessionExpiryInterval,
+ 			AuthenticationMethod:  props.AuthenticationMethod,
+@@ -188,17 +190,22 @@ func (h *Hook) updateClient(cl *mqtt.Client) {
+ }
+ 
+ // OnDisconnect removes a client from the store if they were using a clean session.
++// For persistent sessions the client record is rewritten with the session lease
++// fixed at disconnect time, so that expiry keeps counting across broker restarts.
+ func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
+ 	if h.db == nil {
+ 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
+ 		return
+ 	}
+ 
+-	if !expire {
++	// A taken-over session continues under the new connection: do not overwrite
++	// its records with the old connection's lease or delete them.
++	if cl.StopCause() == packets.ErrSessionTakenOver {
+ 		return
+ 	}
+ 
+-	if cl.StopCause() == packets.ErrSessionTakenOver {
++	if !expire {
++		h.updateClient(cl)
+ 		return
+ 	}
+ 
+@@ -385,16 +392,55 @@ func (h *Hook) OnRetainedExpired(filter string) {
+ 	}
+ }
+ 
+-// OnClientExpired deleted expired clients from the store.
++// OnClientExpired deletes an expired client and all its subscriptions and
++// inflight messages from the store, so that no record of the expired session
++// can reappear on reconnect or after a broker restart.
+ func (h *Hook) OnClientExpired(cl *mqtt.Client) {
+ 	if h.db == nil {
+ 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
+ 		return
+ 	}
+ 
+-	err := h.db.HDel(h.ctx, h.hKey(storage.ClientKey), clientKey(cl)).Err()
+-	if err != nil {
+-		h.Log.Error("failed to delete expired client", "error", err, "id", clientKey(cl))
++	id := clientKey(cl)
++	if err := h.db.HDel(h.ctx, h.hKey(storage.ClientKey), id).Err(); err != nil {
++		h.Log.Error("failed to delete expired client", "error", err, "id", id)
++	}
++
++	// Subscriptions and inflight messages live in shared hashes keyed by
++	// "client-id:filter" / "client-id:packet-id".
++	h.deleteHashFieldsByPrefix(h.hKey(storage.SubscriptionKey), id+":")
++	h.deleteHashFieldsByPrefix(h.hKey(storage.InflightKey), id+":")
++}
++
++// deleteHashFieldsByPrefix removes all fields of a hash whose names start
++// with prefix, scanning incrementally to avoid blocking redis with a full
++// hash dump.
++func (h *Hook) deleteHashFieldsByPrefix(key, prefix string) {
++	var cursor uint64
++	for {
++		rows, next, err := h.db.HScan(h.ctx, key, cursor, prefix+"*", 256).Result()
++		if err != nil {
++			if !errors.Is(err, redis.Nil) {
++				h.Log.Error("failed to scan hash fields", "error", err, "key", key, "prefix", prefix)
++			}
++			return
++		}
++
++		fields := make([]string, 0, len(rows)/2)
++		for i := 0; i+1 < len(rows); i += 2 { // HScan returns alternating field/value pairs
++			fields = append(fields, rows[i])
++		}
++		if len(fields) > 0 {
++			if err := h.db.HDel(h.ctx, key, fields...).Err(); err != nil {
++				h.Log.Error("failed to delete hash fields", "error", err, "key", key, "prefix", prefix)
++				return
++			}
++		}
++
++		if next == 0 {
++			return
++		}
++		cursor = next
+ 	}
+ }
+ 
+diff --git a/mqtt/hooks/storage/redis/redis_test.go b/mqtt/hooks/storage/redis/redis_test.go
+index 2145baa..f370887 100644
+--- a/mqtt/hooks/storage/redis/redis_test.go
++++ b/mqtt/hooks/storage/redis/redis_test.go
+@@ -253,6 +253,72 @@ func TestOnClientExpired(t *testing.T) {
+ 	require.ErrorIs(t, redis.Nil, err)
+ }
+ 
++// TestOnClientExpiredRemovesSessionState verifies that expiring a client removes
++// its subscriptions and inflight messages from the shared hashes (fields keyed
++// by "client-id:filter" / "client-id:packet-id"), while another client's
++// records stay untouched.
++func TestOnClientExpiredRemovesSessionState(t *testing.T) {
++	s := miniredis.RunT(t)
++	defer s.Close()
++	h := newHook(t, s.Addr())
++	defer teardown(t, h)
++
++	require.NoError(t, h.db.HSet(h.ctx, h.hKey(storage.ClientKey), "cl1", &storage.Client{ID: "cl1"}).Err())
++	require.NoError(t, h.db.HSet(h.ctx, h.hKey(storage.SubscriptionKey), "cl1:a/b", &storage.Subscription{ID: "cl1:a/b", Client: "cl1", Filter: "a/b"}).Err())
++	require.NoError(t, h.db.HSet(h.ctx, h.hKey(storage.InflightKey), "cl1:1", &storage.Message{ID: "cl1:1", Origin: "cl1", PacketID: 1}).Err())
++	require.NoError(t, h.db.HSet(h.ctx, h.hKey(storage.SubscriptionKey), "cl2:c/d", &storage.Subscription{ID: "cl2:c/d", Client: "cl2", Filter: "c/d"}).Err())
++	// a different client whose id shares the same prefix must not be swept
++	require.NoError(t, h.db.HSet(h.ctx, h.hKey(storage.SubscriptionKey), "cl11:e/f", &storage.Subscription{ID: "cl11:e/f", Client: "cl11", Filter: "e/f"}).Err())
++
++	h.OnClientExpired(&mqtt.Client{ID: "cl1"})
++
++	_, err := h.db.HGet(h.ctx, h.hKey(storage.ClientKey), "cl1").Result()
++	require.ErrorIs(t, err, redis.Nil)
++	_, err = h.db.HGet(h.ctx, h.hKey(storage.SubscriptionKey), "cl1:a/b").Result()
++	require.ErrorIs(t, err, redis.Nil)
++	_, err = h.db.HGet(h.ctx, h.hKey(storage.InflightKey), "cl1:1").Result()
++	require.ErrorIs(t, err, redis.Nil)
++
++	// other clients survive
++	_, err = h.db.HGet(h.ctx, h.hKey(storage.SubscriptionKey), "cl2:c/d").Result()
++	require.NoError(t, err)
++	_, err = h.db.HGet(h.ctx, h.hKey(storage.SubscriptionKey), "cl11:e/f").Result()
++	require.NoError(t, err)
++}
++
++// TestOnDisconnectPersistsSessionLease verifies that a persistent disconnect
++// rewrites the client record with the lease fixed at disconnect time, while a
++// taken-over session leaves its online record untouched.
++func TestOnDisconnectPersistsSessionLease(t *testing.T) {
++	s := miniredis.RunT(t)
++	defer s.Close()
++	h := newHook(t, s.Addr())
++	defer teardown(t, h)
++
++	cl := &mqtt.Client{ID: "lease", Net: mqtt.ClientConnection{Remote: "r", Listener: "l"}}
++	h.OnSessionEstablished(cl, packets.Packet{})
++	cl.Stop(nil)
++	h.OnDisconnect(cl, nil, false)
++
++	row, err := h.db.HGet(h.ctx, h.hKey(storage.ClientKey), "lease").Result()
++	require.NoError(t, err)
++	r := new(storage.Client)
++	require.NoError(t, r.UnmarshalBinary([]byte(row)))
++	require.Equal(t, cl.DisconnectedAt(), r.DisconnectedAt)
++	require.Greater(t, r.DisconnectedAt, int64(0))
++
++	// taken-over connection: the online record must not be overwritten with a lease
++	taken := &mqtt.Client{ID: "take", Net: mqtt.ClientConnection{Remote: "r", Listener: "l"}}
++	h.OnSessionEstablished(taken, packets.Packet{})
++	taken.Stop(packets.ErrSessionTakenOver)
++	h.OnDisconnect(taken, nil, false)
++	row, err = h.db.HGet(h.ctx, h.hKey(storage.ClientKey), "take").Result()
++	require.NoError(t, err)
++	r2 := new(storage.Client)
++	require.NoError(t, r2.UnmarshalBinary([]byte(row)))
++	require.Equal(t, int64(0), r2.DisconnectedAt, "taken-over session keeps its online record")
++}
++
+ func TestOnClientExpiredClosedDB(t *testing.T) {
+ 	s := miniredis.RunT(t)
+ 	defer s.Close()
+diff --git a/mqtt/hooks/storage/storage.go b/mqtt/hooks/storage/storage.go
+index b7f6ce4..6c15cc6 100644
+--- a/mqtt/hooks/storage/storage.go
++++ b/mqtt/hooks/storage/storage.go
+@@ -36,6 +36,14 @@ type Client struct {
+ 	Listener        string           `json:"listener,omitempty"`   // the listener the client connected on
+ 	ProtocolVersion byte             `json:"protocolVersion"`      // mqtt protocol version of the client
+ 	Clean           bool             `json:"clean,omitempty"`      // if the client requested a clean start/session
++	// DisconnectedAt is the unix time the connection went down. It is zero while
++	// the client is connected and is used to persist the session lease so that
++	// expiry keeps counting across broker restarts.
++	DisconnectedAt int64 `json:"disconnectedAt,omitempty"`
++	// ExpiresAt is the absolute unix deadline of the session lease computed at
++	// disconnect time (DisconnectedAt + effective session expiry interval).
++	// Zero means the session is online or has no persistent lease.
++	ExpiresAt int64 `json:"expiresAt,omitempty"`
+ }
+ 
+ // ClientProperties contains a limited set of the mqtt v5 properties specific to a client connection.
+diff --git a/mqtt/server.go b/mqtt/server.go
+index 7327325..d069564 100644
+--- a/mqtt/server.go
++++ b/mqtt/server.go
+@@ -511,43 +511,51 @@ func (s *Server) validateConnect(cl *Client, pk packets.Packet) packets.Code {
+ // session is abandoned.
+ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
+ 	if existing, ok := s.Clients.Get(pk.Connect.ClientIdentifier); ok {
+-		_ = s.DisconnectClient(existing, packets.ErrSessionTakenOver)                                   // [MQTT-3.1.4-3]
+-		s.Clients.Delete(existing.ID)                                                                   // prevent race: remove old entry before adding new one
+-		if pk.Connect.Clean || (existing.Properties.Clean && existing.Properties.ProtocolVersion < 5) { // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
+-			s.UnsubscribeClient(existing)
+-			existing.ClearInflights(math.MaxInt64, 0)
+-			atomic.StoreUint32(&existing.State.isTakenOver, 1) // only set isTakenOver after unsubscribe has occurred
+-			return false                                       // [MQTT-3.2.2-3]
+-		}
++		// An offline (restored or disconnected) session whose lease has already
++		// expired must not be inherited. Purge it completely and fall through to
++		// establish a fresh session; the client record, subscriptions and inflight
++		// messages are removed from both memory and the persistent store.
++		if (existing.Net.Conn == nil || existing.Closed()) && s.sessionLeaseExpired(existing, time.Now().Unix()) {
++			s.deleteExpiredClient(existing.ID, existing)
++		} else {
++			_ = s.DisconnectClient(existing, packets.ErrSessionTakenOver)                                   // [MQTT-3.1.4-3]
++			s.Clients.Delete(existing.ID)                                                                   // prevent race: remove old entry before adding new one
++			if pk.Connect.Clean || (existing.Properties.Clean && existing.Properties.ProtocolVersion < 5) { // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
++				s.UnsubscribeClient(existing)
++				existing.ClearInflights(math.MaxInt64, 0)
++				atomic.StoreUint32(&existing.State.isTakenOver, 1) // only set isTakenOver after unsubscribe has occurred
++				return false                                       // [MQTT-3.2.2-3]
++			}
+ 
+-		atomic.StoreUint32(&existing.State.isTakenOver, 1)
+-		if existing.State.Inflight.Len() > 0 {
+-			cl.State.Inflight = existing.State.Inflight.Clone() // [MQTT-3.1.2-5]
+-			if cl.State.Inflight.maximumReceiveQuota == 0 && cl.ops.options.Capabilities.ReceiveMaximum != 0 {
+-				cl.State.Inflight.ResetReceiveQuota(int32(cl.ops.options.Capabilities.ReceiveMaximum)) // server receive max per client
+-				cl.State.Inflight.ResetSendQuota(int32(cl.Properties.Props.ReceiveMaximum))            // client receive max
++			atomic.StoreUint32(&existing.State.isTakenOver, 1)
++			if existing.State.Inflight.Len() > 0 {
++				cl.State.Inflight = existing.State.Inflight.Clone() // [MQTT-3.1.2-5]
++				if cl.State.Inflight.maximumReceiveQuota == 0 && cl.ops.options.Capabilities.ReceiveMaximum != 0 {
++					cl.State.Inflight.ResetReceiveQuota(int32(cl.ops.options.Capabilities.ReceiveMaximum)) // server receive max per client
++					cl.State.Inflight.ResetSendQuota(int32(cl.Properties.Props.ReceiveMaximum))            // client receive max
++				}
+ 			}
+-		}
+ 
+-		for _, sub := range existing.State.Subscriptions.GetAll() {
+-			isNew, count := s.Topics.Subscribe(cl.ID, sub) // [MQTT-3.8.4-3]
+-			if isNew {
+-				atomic.AddInt64(&s.Info.Subscriptions, 1)
+-				s.hooks.OnSubscribed(existing, packets.Packet{Filters: []packets.Subscription{sub}}, []byte{sub.Qos}, []int{count})
++			for _, sub := range existing.State.Subscriptions.GetAll() {
++				isNew, count := s.Topics.Subscribe(cl.ID, sub) // [MQTT-3.8.4-3]
++				if isNew {
++					atomic.AddInt64(&s.Info.Subscriptions, 1)
++					s.hooks.OnSubscribed(existing, packets.Packet{Filters: []packets.Subscription{sub}}, []byte{sub.Qos}, []int{count})
++				}
++				cl.State.Subscriptions.Add(sub.Filter, sub)
++				s.publishRetainedToClient(cl, sub, !isNew)
+ 			}
+-			cl.State.Subscriptions.Add(sub.Filter, sub)
+-			s.publishRetainedToClient(cl, sub, !isNew)
+-		}
+ 
+-		// Clean the state of the existing client to prevent sequential take-overs
+-		// from increasing memory usage by inflights + subs * client-id.
+-		s.UnsubscribeClient(existing)
+-		existing.ClearInflights(math.MaxInt64, 0)
++			// Clean the state of the existing client to prevent sequential take-overs
++			// from increasing memory usage by inflights + subs * client-id.
++			s.UnsubscribeClient(existing)
++			existing.ClearInflights(math.MaxInt64, 0)
+ 
+-		s.Log.Debug("session taken over", "client", cl.ID, "old_remote", existing.Net.Remote, "new_remote", cl.Net.Remote)
++			s.Log.Debug("session taken over", "client", cl.ID, "old_remote", existing.Net.Remote, "new_remote", cl.Net.Remote)
+ 
+-		cl.InheritWay = InheritWayLocal
+-		return true // [MQTT-3.2.2-3]
++			cl.InheritWay = InheritWayLocal
++			return true // [MQTT-3.2.2-3]
++		}
+ 	}
+ 
+ 	for {
+@@ -565,7 +573,7 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
+ 		return false
+ 	}
+ 
+-	if s.loadClientHistory(cl.ID) {
++	if s.restoreClientSession(cl) {
+ 		cl.InheritWay = InheritWayRemote
+ 		return true
+ 	}
+@@ -637,25 +645,83 @@ func (s *Server) SendConnack(cl *Client, reason packets.Code, present bool, prop
+ 	return cl.WritePacket(ack)
+ }
+ 
+-// loadClientHistory loads history info of client
+-func (s *Server) loadClientHistory(cid string) bool {
+-	ss, err := s.hooks.StoredSubscriptionsByCid(cid)
+-	if err != nil {
+-		return false
++// restoreClientSession restores a persistent session owned by the connecting
++// client from the persistent store (e.g. after a broker restart or when the
++// client reconnects to a different cluster node). It returns whether a live
++// (non-expired) session was found, in which case the caller reports session
++// present per protocol and resends unfinished qos deliveries.
++//
++// The persisted client record carries the session lease: if the lease already
++// elapsed, the session must not reappear, so all its persistent records are
++// purged. Subscriptions and unfinished qos messages are attached directly to
++// the new client (it is not in the clients map yet). Failures while reading a
++// single kind of record are logged and partially restored instead of failing
++// the whole connection.
++func (s *Server) restoreClientSession(cl *Client) bool {
++	now := time.Now().Unix()
++	present := false
++
++	if sc, err := s.hooks.StoredClientByCid(cl.ID); err != nil {
++		s.Log.Warn("failed to read persisted client session; restoring session state best-effort", "error", err, "client", cl.ID)
++	} else if sc.ID != "" {
++		if sc.ExpiresAt > 0 && sc.ExpiresAt < now {
++			// The lease elapsed while no broker held the session in memory:
++			// remove every persistent record so the session cannot reappear.
++			s.purgeStoredSession(cl.ID)
++			return false
++		}
++		present = true
+ 	}
+-	s.loadSubscriptions(ss)
+ 
+-	fs, err := s.hooks.StoredInflightMessagesByCid(cid)
+-	if err != nil {
+-		return false
++	if ss, err := s.hooks.StoredSubscriptionsByCid(cl.ID); err != nil {
++		s.Log.Warn("failed to restore persisted subscriptions", "error", err, "client", cl.ID)
++	} else {
++		for _, sub := range ss {
++			sb := packets.Subscription{
++				Filter:            sub.Filter,
++				RetainHandling:    sub.RetainHandling,
++				Qos:               sub.Qos,
++				RetainAsPublished: sub.RetainAsPublished,
++				NoLocal:           sub.NoLocal,
++				Identifier:        sub.Identifier,
++			}
++			s.Topics.Subscribe(cl.ID, sb) // [MQTT-3.8.4-3]
++			cl.State.Subscriptions.Add(sb.Filter, sb)
++			// The subscription already existed for this session, so retained
++			// messages are delivered as for an existing subscription.
++			s.publishRetainedToClient(cl, sb, true)
++			present = true
++		}
+ 	}
+-	s.loadInflight(fs)
+ 
+-	if len(ss) > 0 || len(fs) > 0 {
+-		return true
++	if fs, err := s.hooks.StoredInflightMessagesByCid(cl.ID); err != nil {
++		s.Log.Warn("failed to restore persisted inflight messages", "error", err, "client", cl.ID)
++	} else {
++		for _, msg := range fs {
++			cl.State.Inflight.Set(msg.ToPacket())
++			present = true
++		}
+ 	}
+ 
+-	return false
++	return present
++}
++
++// purgeStoredSession removes all persistent records of a client session
++// (client entry, subscriptions and inflight messages) without requiring the
++// session to be resident in memory. It is used when a reconnect reveals that
++// the persisted lease has already expired.
++func (s *Server) purgeStoredSession(cid string) {
++	// Build a throwaway client holder (no listener, no write loop goroutine):
++	// storage hooks key session cleanup by client id only.
++	tmp := newClient(nil, &ops{
++		options: s.Options,
++		info:    s.Info,
++		hooks:   s.hooks,
++		log:     s.Log,
++	})
++	tmp.ID = cid
++	s.hooks.OnClientExpired(tmp)
++	s.Log.Info("purged expired persisted client session", "client", cid)
+ }
+ 
+ // processPacket processes an inbound packet for a client. Since the method is
+@@ -1693,12 +1759,25 @@ func (s *Server) sendLWT(cl *Client) {
+ 
+ // readStore reads in any data from the persistent datastore (if applicable).
+ func (s *Server) readStore() error {
++	// Load the system info first: its timestamp is the last moment the previous
++	// broker process was known to be alive, used as a fallback anchor when
++	// reconstructing session leases whose disconnect moment was never persisted
++	// (e.g. the broker crashed).
++	var sysInfo storage.SystemInfo
++	if s.hooks.Provides(StoredSysInfo) {
++		si, err := s.hooks.StoredSysInfo()
++		if err != nil {
++			return fmt.Errorf("load server info; %w", err)
++		}
++		sysInfo = si
++	}
++
+ 	if s.hooks.Provides(StoredClients) {
+ 		clients, err := s.hooks.StoredClients()
+ 		if err != nil {
+ 			return fmt.Errorf("failed to load clients; %w", err)
+ 		}
+-		s.loadClients(clients)
++		s.loadClients(clients, sysInfo.Time)
+ 		s.Log.Debug("loaded clients from store", "len", len(clients))
+ 	}
+ 
+@@ -1729,15 +1808,18 @@ func (s *Server) readStore() error {
+ 		s.Log.Debug("loaded retained messages from store", "len", len(retained))
+ 	}
+ 
++	// Restore the counters first so that the expiry sweep below adjusts them
++	// with the persisted values as the baseline.
+ 	if s.hooks.Provides(StoredSysInfo) {
+-		sysInfo, err := s.hooks.StoredSysInfo()
+-		if err != nil {
+-			return fmt.Errorf("load server info; %w", err)
+-		}
+ 		s.loadServerInfo(sysInfo.Info)
+ 		s.Log.Debug("loaded $SYS info from store")
+ 	}
+ 
++	// Sessions whose lease already elapsed while the broker was down must not
++	// reappear: purge them (together with their subscriptions and inflight
++	// messages) before listeners start accepting connections.
++	s.clearExpiredClients(time.Now().Unix())
++
+ 	return nil
+ }
+ 
+@@ -1783,8 +1865,17 @@ func (s *Server) loadSubscriptions(v []storage.Subscription) {
+ 	}
+ }
+ 
+-// loadClients restores clients from the datastore.
+-func (s *Server) loadClients(v []storage.Client) {
++// loadClients restores clients from the datastore. aliveUntil optionally
++// provides the last time the broker was known to be alive; it anchors the
++// lease of records written without a persisted disconnect moment (older
++// records or a crashed broker).
++func (s *Server) loadClients(v []storage.Client, aliveUntil ...int64) {
++	now := time.Now().Unix()
++	fallback := now
++	if len(aliveUntil) > 0 && aliveUntil[0] > 0 {
++		fallback = aliveUntil[0]
++	}
++
+ 	for _, c := range v {
+ 		cl := s.NewClient(nil, c.Listener, c.ID, false)
+ 		cl.Properties.Username = c.Username
+@@ -1804,6 +1895,23 @@ func (s *Server) loadClients(v []storage.Client) {
+ 			MaximumPacketSize:         c.Properties.MaximumPacketSize,
+ 		}
+ 		cl.Properties.Will = Will(c.Will)
++
++		// Restore the session lease. The broker is restarting, so every restored
++		// client is offline: records missing the lease get anchored to the last
++		// moment the broker was alive, then the deadline is derived from the
++		// negotiated expiry interval exactly as if the client had disconnected
++		// at that moment.
++		disconnectedAt := c.DisconnectedAt
++		if disconnectedAt == 0 {
++			disconnectedAt = fallback
++		}
++		expiresAt := c.ExpiresAt
++		if expiresAt == 0 && disconnectedAt > 0 {
++			expiresAt = cl.sessionExpiresAt(disconnectedAt)
++		}
++		atomic.StoreInt64(&cl.State.disconnected, disconnectedAt)
++		atomic.StoreInt64(&cl.State.expiresAt, expiresAt)
++
+ 		s.Clients.Add(cl)
+ 	}
+ }
+@@ -1828,21 +1936,48 @@ func (s *Server) loadRetained(v []storage.Message) {
+ // than their given expiry intervals.
+ func (s *Server) clearExpiredClients(dt int64) {
+ 	for id, client := range s.Clients.GetAll() {
+-		disconnected := atomic.LoadInt64(&client.State.disconnected)
+-		if disconnected == 0 {
+-			continue
++		if s.sessionLeaseExpired(client, dt) {
++			s.deleteExpiredClient(id, client)
+ 		}
++	}
++}
+ 
+-		expire := s.Options.Capabilities.MaximumSessionExpiryInterval
+-		if client.Properties.ProtocolVersion == 5 && client.Properties.Props.SessionExpiryIntervalFlag {
+-			expire = client.Properties.Props.SessionExpiryInterval
+-		}
++// sessionLeaseExpired reports whether an offline client's session lease has
++// elapsed at time dt. The lease is the absolute deadline fixed at disconnect
++// time, so it keeps counting across broker restarts. Connected clients (no
++// disconnect recorded) never expire.
++func (s *Server) sessionLeaseExpired(cl *Client, dt int64) bool {
++	disconnected := cl.DisconnectedAt()
++	if disconnected == 0 {
++		return false // connected, or a restored record for an online session
++	}
+ 
+-		if disconnected+int64(expire) < dt {
+-			s.hooks.OnClientExpired(client)
+-			s.Clients.Delete(id) // [MQTT-4.1.0-2]
++	expiresAt := cl.SessionExpiresAt()
++	if expiresAt == 0 {
++		// Backwards compatibility for state without a persisted deadline: derive
++		// the deadline from the negotiated/configured expiry interval.
++		expire := int64(s.Options.Capabilities.MaximumSessionExpiryInterval)
++		if cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryIntervalFlag {
++			expire = int64(cl.Properties.Props.SessionExpiryInterval)
+ 		}
++		expiresAt = disconnected + expire
+ 	}
++
++	return expiresAt < dt
++}
++
++// deleteExpiredClient removes an expired session everywhere: the persistent
++// records (client entry, subscriptions and inflight messages), the topic trie,
++// the client inflight state and the in-memory clients map. The storage hooks
++// perform a full keyed cleanup first, which also covers records missing from
++// the in-memory state due to partial restore failures; the subscription and
++// inflight cascades then remove anything still resident in memory.
++func (s *Server) deleteExpiredClient(id string, client *Client) {
++	s.hooks.OnClientExpired(client)
++	s.UnsubscribeClient(client)
++	client.ClearInflights(math.MaxInt64, 0)
++	s.Clients.Delete(id) // [MQTT-4.1.0-2]
++	s.Log.Debug("client session expired", "client", id)
+ }
+ 
+ // clearExpiredRetainedMessage deletes retained messages from topics if they have expired.
+diff --git a/mqtt/server_test.go b/mqtt/server_test.go
+index d855c50..3eac2ab 100644
+--- a/mqtt/server_test.go
++++ b/mqtt/server_test.go
+@@ -7,6 +7,7 @@ package mqtt
+ import (
+ 	"bytes"
+ 	"encoding/binary"
++	"errors"
+ 	"io"
+ 	"log/slog"
+ 	"net"
+@@ -4113,6 +4114,245 @@ func TestConvertMessageMapToSlice(t *testing.T) {
+ 	require.Len(t, result, 3)
+ }
+ 
++// sessionStoreHook is a test hook emulating per-client persistent records
++// (like the clustered redis store): it provides client-record, subscriptions
++// and inflight message lookups by client id and records expiry callbacks.
++type sessionStoreHook struct {
++	HookBase
++	clients   map[string]storage.Client
++	subs      map[string][]storage.Subscription
++	inflight  map[string][]storage.Message
++	clientErr error
++	subsErr   error
++	ifmErr    error
++	expired   []string
++}
++
++func (h *sessionStoreHook) ID() string { return "session-store" }
++
++func (h *sessionStoreHook) Provides(b byte) bool {
++	switch b {
++	case StoredClientByCid, StoredSubscriptionsByCid, StoredInflightMessagesByCid, OnClientExpired:
++		return true
++	}
++	return false
++}
++
++func (h *sessionStoreHook) StoredClientByCid(cid string) (storage.Client, error) {
++	if h.clientErr != nil {
++		return storage.Client{}, h.clientErr
++	}
++	return h.clients[cid], nil
++}
++
++func (h *sessionStoreHook) StoredSubscriptionsByCid(cid string) ([]storage.Subscription, error) {
++	if h.subsErr != nil {
++		return nil, h.subsErr
++	}
++	return h.subs[cid], nil
++}
++
++func (h *sessionStoreHook) StoredInflightMessagesByCid(cid string) ([]storage.Message, error) {
++	if h.ifmErr != nil {
++		return nil, h.ifmErr
++	}
++	return h.inflight[cid], nil
++}
++
++func (h *sessionStoreHook) OnClientExpired(cl *Client) {
++	h.expired = append(h.expired, cl.ID)
++}
++
++// TestLoadClientsSessionLease verifies that the session lease (disconnect moment
++// and absolute expiry deadline) is reconstructed when clients are restored from
++// the store, including the fallback for records without a persisted lease.
++func TestLoadClientsSessionLease(t *testing.T) {
++	s := newServer()
++	now := time.Now().Unix()
++
++	v := []storage.Client{
++		{ID: "with-lease", DisconnectedAt: now - 10, ExpiresAt: now + 50},
++		{ID: "no-lease", ProtocolVersion: 5, Properties: storage.ClientProperties{
++			SessionExpiryInterval:     100,
++			SessionExpiryIntervalFlag: true,
++		}},
++	}
++	s.loadClients(v, now-20)
++
++	c1, ok := s.Clients.Get("with-lease")
++	require.True(t, ok)
++	require.Equal(t, now-10, c1.DisconnectedAt())
++	require.Equal(t, now+50, c1.SessionExpiresAt())
++	require.False(t, s.sessionLeaseExpired(c1, now))
++	require.True(t, s.sessionLeaseExpired(c1, now+51))
++
++	c2, ok := s.Clients.Get("no-lease")
++	require.True(t, ok)
++	require.Equal(t, now-20, c2.DisconnectedAt()) // anchored to the last-known-alive time
++	require.Equal(t, now-20+100, c2.SessionExpiresAt())
++	require.False(t, s.sessionLeaseExpired(c2, now))
++	require.True(t, s.sessionLeaseExpired(c2, now+200))
++}
++
++// TestClearExpiredClientsSessionCascade verifies that expiring a session removes
++// its subscriptions from the topic trie, its inflight messages, the in-memory
++// client and invokes the OnClientExpired hook so storage records can be removed.
++func TestClearExpiredClientsSessionCascade(t *testing.T) {
++	s := newServer()
++	hook := new(sessionStoreHook)
++	hook.clients = map[string]storage.Client{}
++	require.NoError(t, s.AddHook(hook, nil))
++
++	now := time.Now().Unix()
++
++	cl, _, _ := newTestClient()
++	cl.ID = "expired"
++	cl.Net.Conn = nil
++	cl.Properties.ProtocolVersion = 5
++	cl.State.disconnected = now - 10
++	cl.State.expiresAt = now - 1
++	sub := packets.Subscription{Filter: "a/b/c", Qos: 1}
++	cl.State.Subscriptions.Add("a/b/c", sub)
++	s.Topics.Subscribe(cl.ID, sub)
++	cl.State.Inflight.Set(packets.Packet{PacketID: 3, TopicName: "a/b/c"})
++	s.Clients.Add(cl)
++
++	require.Equal(t, 1, len(s.Topics.Subscribers("a/b/c").Subscriptions))
++
++	s.clearExpiredClients(now)
++
++	_, ok := s.Clients.Get("expired")
++	require.False(t, ok)
++	require.Equal(t, 0, len(s.Topics.Subscribers("a/b/c").Subscriptions))
++	require.Equal(t, []string{"expired"}, hook.expired)
++}
++
++// TestInheritClientSessionExpiredLease verifies that an offline session whose
++// lease has elapsed is not inherited on reconnect: the old state is purged and
++// the broker reports no existing session. Unexpired leases are inherited.
++func TestInheritClientSessionExpiredLease(t *testing.T) {
++	s := newServer()
++	hook := new(sessionStoreHook)
++	require.NoError(t, s.AddHook(hook, nil))
++
++	now := time.Now().Unix()
++
++	placeholder, _, _ := newTestClient()
++	placeholder.Net.Conn = nil
++	placeholder.ID = "cid"
++	placeholder.Properties.ProtocolVersion = 5
++	placeholder.State.disconnected = now - 100
++	placeholder.State.expiresAt = now - 1
++	sub := packets.Subscription{Filter: "a/b/c", Qos: 1}
++	placeholder.State.Subscriptions.Add("a/b/c", sub)
++	s.Topics.Subscribe(placeholder.ID, sub)
++	placeholder.State.Inflight.Set(packets.Packet{PacketID: 9, TopicName: "a/b/c"})
++	s.Clients.Add(placeholder)
++
++	cl, _, _ := newTestClient()
++	cl.Properties.ProtocolVersion = 5
++
++	present := s.inheritClientSession(packets.Packet{Connect: packets.ConnectParams{ClientIdentifier: "cid"}}, cl)
++	require.False(t, present)
++	_, ok := s.Clients.Get("cid") // purged; the new client is added by the caller
++	require.False(t, ok)
++	require.Equal(t, 0, cl.State.Inflight.Len())
++	require.Equal(t, 0, len(s.Topics.Subscribers("a/b/c").Subscriptions))
++	require.Equal(t, []string{"cid"}, hook.expired)
++
++	// Unexpired restored placeholder is inherited with subs and inflight.
++	placeholder2, _, _ := newTestClient()
++	placeholder2.Net.Conn = nil
++	placeholder2.ID = "cid2"
++	placeholder2.Properties.ProtocolVersion = 5
++	placeholder2.State.disconnected = now - 1
++	placeholder2.State.expiresAt = now + 100
++	placeholder2.State.Subscriptions.Add("a/b/c", sub)
++	s.Topics.Subscribe(placeholder2.ID, sub)
++	placeholder2.State.Inflight.Set(packets.Packet{PacketID: 8, TopicName: "a/b/c"})
++	s.Clients.Add(placeholder2)
++
++	cl2, _, _ := newTestClient()
++	cl2.Properties.ProtocolVersion = 5
++	present = s.inheritClientSession(packets.Packet{Connect: packets.ConnectParams{ClientIdentifier: "cid2"}}, cl2)
++	require.True(t, present)
++	require.Equal(t, 1, cl2.State.Subscriptions.Len())
++	require.Equal(t, 1, cl2.State.Inflight.Len())
++}
++
++// TestRestoreClientSessionLease verifies remote (store-backed) session restore:
++// expired persisted sessions are purged and reported absent, live sessions are
++// restored with subscriptions and inflight messages attached, and a failure to
++// read one kind of record is tolerated as long as the client record proves the
++// session is still within its lease.
++func TestRestoreClientSessionLease(t *testing.T) {
++	now := time.Now().Unix()
++
++	// Expired persisted session: purged, session present=false.
++	s := newServer()
++	hook := new(sessionStoreHook)
++	hook.clients = map[string]storage.Client{
++		"gone": {ID: "gone", ExpiresAt: now - 1},
++	}
++	hook.subs = map[string][]storage.Subscription{
++		"gone": {{ID: "gone:a/b/c", Client: "gone", Filter: "a/b/c", Qos: 1}},
++	}
++	hook.inflight = map[string][]storage.Message{
++		"gone": {{Origin: "gone", PacketID: 5, TopicName: "a/b/c"}},
++	}
++	require.NoError(t, s.AddHook(hook, nil))
++
++	cl, _, _ := newTestClient()
++	cl.ID = "gone"
++	require.False(t, s.restoreClientSession(cl))
++	require.Equal(t, []string{"gone"}, hook.expired)
++	require.Equal(t, 0, cl.State.Subscriptions.Len())
++	require.Equal(t, 0, cl.State.Inflight.Len())
++
++	// Live persisted session: state restored onto the new client.
++	s = newServer()
++	hook = new(sessionStoreHook)
++	hook.clients = map[string]storage.Client{
++		"live": {ID: "live", ExpiresAt: now + 100},
++	}
++	hook.subs = map[string][]storage.Subscription{
++		"live": {{ID: "live:a/b/c", Client: "live", Filter: "a/b/c", Qos: 1}},
++	}
++	hook.inflight = map[string][]storage.Message{
++		"live": {{Origin: "live", PacketID: 6, TopicName: "a/b/c", FixedHeader: packets.FixedHeader{Type: packets.Publish}}},
++	}
++	require.NoError(t, s.AddHook(hook, nil))
++
++	cl, _, _ = newTestClient()
++	cl.ID = "live"
++	require.True(t, s.restoreClientSession(cl))
++	require.Equal(t, 1, cl.State.Subscriptions.Len())
++	msg, ok := cl.State.Inflight.Get(6)
++	require.True(t, ok)
++	require.Equal(t, "a/b/c", msg.TopicName)
++	require.Equal(t, 1, len(s.Topics.Subscribers("a/b/c").Subscriptions))
++	require.Empty(t, hook.expired)
++
++	// Subscription read fails: the live client record still proves the session
++	// exists, so the connection is treated as session present and inflight
++	// delivery is restored best-effort.
++	s = newServer()
++	hook = new(sessionStoreHook)
++	hook.clients = map[string]storage.Client{
++		"live2": {ID: "live2", ExpiresAt: now + 100},
++	}
++	hook.subsErr = errors.New("boom")
++	hook.inflight = map[string][]storage.Message{
++		"live2": {{Origin: "live2", PacketID: 7, TopicName: "d/e/f"}},
++	}
++	require.NoError(t, s.AddHook(hook, nil))
++
++	cl, _, _ = newTestClient()
++	cl.ID = "live2"
++	require.True(t, s.restoreClientSession(cl))
++	require.Equal(t, 1, cl.State.Inflight.Len())
++}
++
+ // TestSendRetainedMessagesToClient tests the sendRetainedMessagesToClient helper function
+ func TestSendRetainedMessagesToClient(t *testing.T) {
+ 	s := newServer()

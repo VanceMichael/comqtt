@@ -167,6 +167,8 @@ func (h *Hook) updateClient(cl *mqtt.Client) {
 		Username:        cl.Properties.Username,
 		Clean:           cl.Properties.Clean,
 		ProtocolVersion: cl.Properties.ProtocolVersion,
+		DisconnectedAt:  cl.DisconnectedAt(),
+		ExpiresAt:       cl.SessionExpiresAt(),
 		Properties: storage.ClientProperties{
 			SessionExpiryInterval: props.SessionExpiryInterval,
 			AuthenticationMethod:  props.AuthenticationMethod,
@@ -188,17 +190,22 @@ func (h *Hook) updateClient(cl *mqtt.Client) {
 }
 
 // OnDisconnect removes a client from the store if they were using a clean session.
+// For persistent sessions the client record is rewritten with the session lease
+// fixed at disconnect time, so that expiry keeps counting across broker restarts.
 func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 	if h.db == nil {
 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
 		return
 	}
 
-	if !expire {
+	// A taken-over session continues under the new connection: do not overwrite
+	// its records with the old connection's lease or delete them.
+	if cl.StopCause() == packets.ErrSessionTakenOver {
 		return
 	}
 
-	if cl.StopCause() == packets.ErrSessionTakenOver {
+	if !expire {
+		h.updateClient(cl)
 		return
 	}
 
@@ -385,16 +392,55 @@ func (h *Hook) OnRetainedExpired(filter string) {
 	}
 }
 
-// OnClientExpired deleted expired clients from the store.
+// OnClientExpired deletes an expired client and all its subscriptions and
+// inflight messages from the store, so that no record of the expired session
+// can reappear on reconnect or after a broker restart.
 func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 	if h.db == nil {
 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
 		return
 	}
 
-	err := h.db.HDel(h.ctx, h.hKey(storage.ClientKey), clientKey(cl)).Err()
-	if err != nil {
-		h.Log.Error("failed to delete expired client", "error", err, "id", clientKey(cl))
+	id := clientKey(cl)
+	if err := h.db.HDel(h.ctx, h.hKey(storage.ClientKey), id).Err(); err != nil {
+		h.Log.Error("failed to delete expired client", "error", err, "id", id)
+	}
+
+	// Subscriptions and inflight messages live in shared hashes keyed by
+	// "client-id:filter" / "client-id:packet-id".
+	h.deleteHashFieldsByPrefix(h.hKey(storage.SubscriptionKey), id+":")
+	h.deleteHashFieldsByPrefix(h.hKey(storage.InflightKey), id+":")
+}
+
+// deleteHashFieldsByPrefix removes all fields of a hash whose names start
+// with prefix, scanning incrementally to avoid blocking redis with a full
+// hash dump.
+func (h *Hook) deleteHashFieldsByPrefix(key, prefix string) {
+	var cursor uint64
+	for {
+		rows, next, err := h.db.HScan(h.ctx, key, cursor, prefix+"*", 256).Result()
+		if err != nil {
+			if !errors.Is(err, redis.Nil) {
+				h.Log.Error("failed to scan hash fields", "error", err, "key", key, "prefix", prefix)
+			}
+			return
+		}
+
+		fields := make([]string, 0, len(rows)/2)
+		for i := 0; i+1 < len(rows); i += 2 { // HScan returns alternating field/value pairs
+			fields = append(fields, rows[i])
+		}
+		if len(fields) > 0 {
+			if err := h.db.HDel(h.ctx, key, fields...).Err(); err != nil {
+				h.Log.Error("failed to delete hash fields", "error", err, "key", key, "prefix", prefix)
+				return
+			}
+		}
+
+		if next == 0 {
+			return
+		}
+		cursor = next
 	}
 }
 

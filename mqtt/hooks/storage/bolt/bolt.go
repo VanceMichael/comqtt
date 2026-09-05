@@ -17,6 +17,7 @@ import (
 
 	sgob "github.com/asdine/storm/codec/gob"
 	"github.com/asdine/storm/v3"
+	"github.com/asdine/storm/v3/q"
 	"go.etcd.io/bbolt"
 )
 
@@ -154,6 +155,8 @@ func (h *Hook) updateClient(cl *mqtt.Client) {
 		Username:        cl.Properties.Username,
 		Clean:           cl.Properties.Clean,
 		ProtocolVersion: cl.Properties.ProtocolVersion,
+		DisconnectedAt:  cl.DisconnectedAt(),
+		ExpiresAt:       cl.SessionExpiresAt(),
 		Properties: storage.ClientProperties{
 			SessionExpiryInterval: props.SessionExpiryInterval,
 			AuthenticationMethod:  props.AuthenticationMethod,
@@ -174,17 +177,22 @@ func (h *Hook) updateClient(cl *mqtt.Client) {
 }
 
 // OnDisconnect removes a client from the store if they were using a clean session.
+// For persistent sessions the client record is rewritten with the session lease
+// fixed at disconnect time, so that expiry keeps counting across broker restarts.
 func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 	if h.db == nil {
 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
 		return
 	}
 
-	if !expire {
+	// A taken-over session continues under the new connection: do not overwrite
+	// its records with the old connection's lease or delete them.
+	if cl.StopCause() == packets.ErrSessionTakenOver {
 		return
 	}
 
-	if cl.StopCause() == packets.ErrSessionTakenOver {
+	if !expire {
+		h.updateClient(cl)
 		return
 	}
 
@@ -374,16 +382,39 @@ func (h *Hook) OnRetainedExpired(filter string) {
 	}
 }
 
-// OnClientExpired deleted expired clients from the store.
+// OnClientExpired deletes an expired client and all its subscriptions and
+// inflight messages from the store, so that no record of the expired session
+// can reappear on reconnect or after a broker restart.
 func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 	if h.db == nil {
 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
 		return
 	}
 
-	err := h.db.DeleteStruct(&storage.Client{ID: clientKey(cl)})
+	id := clientKey(cl)
+	err := h.db.DeleteStruct(&storage.Client{ID: id})
 	if err != nil && !errors.Is(err, storm.ErrNotFound) {
-		h.Log.Error("failed to delete expired client", "error", err, "id", clientKey(cl))
+		h.Log.Error("failed to delete expired client", "error", err, "id", id)
+	}
+
+	var subs []storage.Subscription
+	if err = h.db.Select(q.Eq("T", storage.SubscriptionKey), q.Eq("Client", id)).Find(&subs); err != nil && !errors.Is(err, storm.ErrNotFound) {
+		h.Log.Error("failed to find subscriptions of expired client", "error", err, "id", id)
+	}
+	for i := range subs {
+		if err = h.db.DeleteStruct(&storage.Subscription{ID: subs[i].ID}); err != nil && !errors.Is(err, storm.ErrNotFound) {
+			h.Log.Error("failed to delete subscription of expired client", "error", err, "id", subs[i].ID)
+		}
+	}
+
+	var msgs []storage.Message
+	if err = h.db.Select(q.Eq("T", storage.InflightKey), q.Eq("Origin", id)).Find(&msgs); err != nil && !errors.Is(err, storm.ErrNotFound) {
+		h.Log.Error("failed to find inflight messages of expired client", "error", err, "id", id)
+	}
+	for i := range msgs {
+		if err = h.db.DeleteStruct(&storage.Message{ID: msgs[i].ID}); err != nil && !errors.Is(err, storm.ErrNotFound) {
+			h.Log.Error("failed to delete inflight message of expired client", "error", err, "id", msgs[i].ID)
+		}
 	}
 }
 

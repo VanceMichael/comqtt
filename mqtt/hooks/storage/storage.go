@@ -36,6 +36,14 @@ type Client struct {
 	Listener        string           `json:"listener,omitempty"`   // the listener the client connected on
 	ProtocolVersion byte             `json:"protocolVersion"`      // mqtt protocol version of the client
 	Clean           bool             `json:"clean,omitempty"`      // if the client requested a clean start/session
+	// DisconnectedAt is the unix time the connection went down. It is zero while
+	// the client is connected and is used to persist the session lease so that
+	// expiry keeps counting across broker restarts.
+	DisconnectedAt int64 `json:"disconnectedAt,omitempty"`
+	// ExpiresAt is the absolute unix deadline of the session lease computed at
+	// disconnect time (DisconnectedAt + effective session expiry interval).
+	// Zero means the session is online or has no persistent lease.
+	ExpiresAt int64 `json:"expiresAt,omitempty"`
 }
 
 // ClientProperties contains a limited set of the mqtt v5 properties specific to a client connection.

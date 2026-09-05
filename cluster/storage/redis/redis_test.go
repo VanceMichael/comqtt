@@ -109,6 +109,9 @@ func TestProvides(t *testing.T) {
 	require.True(t, s.Provides(mqtt.StoredRetainedMessages))
 	require.True(t, s.Provides(mqtt.StoredSubscriptions))
 	require.True(t, s.Provides(mqtt.StoredSysInfo))
+	require.True(t, s.Provides(mqtt.StoredClientByCid))
+	require.True(t, s.Provides(mqtt.StoredSubscriptionsByCid))
+	require.True(t, s.Provides(mqtt.StoredInflightMessagesByCid))
 	require.False(t, s.Provides(mqtt.OnACLCheck))
 	require.False(t, s.Provides(mqtt.OnConnectAuthenticate))
 }
@@ -252,6 +255,70 @@ func TestOnClientExpired(t *testing.T) {
 	_, err = s.db.HGet(s.ctx, s.hKey(storage.ClientKey), clientKey).Result()
 	require.Error(t, err)
 	require.ErrorIs(t, redis.Nil, err)
+}
+
+// TestOnClientExpiredRemovesSessionState verifies that expiring a client removes
+// the client record together with its per-client subscription and inflight
+// hash keys, while records of other clients stay untouched.
+func TestOnClientExpiredRemovesSessionState(t *testing.T) {
+	m := miniredis.RunT(t)
+	defer m.Close()
+	s := newHook(t, m.Addr())
+	defer teardown(t, s)
+
+	require.NoError(t, s.db.HSet(s.ctx, s.hKey(storage.ClientKey), "cl1", &storage.Client{ID: "cl1"}).Err())
+	require.NoError(t, s.db.HSet(s.ctx, s.hKey(utils.JoinStrings(storage.SubscriptionKey, "cl1")), "a/b", &storage.Subscription{Filter: "a/b"}).Err())
+	require.NoError(t, s.db.HSet(s.ctx, s.hKey(utils.JoinStrings(storage.InflightKey, "cl1")), "1", &storage.Message{Origin: "cl1", PacketID: 1}).Err())
+	require.NoError(t, s.db.HSet(s.ctx, s.hKey(utils.JoinStrings(storage.SubscriptionKey, "cl2")), "c/d", &storage.Subscription{Filter: "c/d"}).Err())
+
+	s.OnClientExpired(&mqtt.Client{ID: "cl1"})
+
+	n, err := s.db.Exists(s.ctx, s.hKey(utils.JoinStrings(storage.SubscriptionKey, "cl1"))).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), n)
+	n, err = s.db.Exists(s.ctx, s.hKey(utils.JoinStrings(storage.InflightKey, "cl1"))).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), n)
+	_, err = s.db.HGet(s.ctx, s.hKey(storage.ClientKey), "cl1").Result()
+	require.ErrorIs(t, err, redis.Nil)
+
+	// other clients' records must survive
+	n, err = s.db.Exists(s.ctx, s.hKey(utils.JoinStrings(storage.SubscriptionKey, "cl2"))).Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n)
+}
+
+// TestOnDisconnectPersistsSessionLease verifies that a persistent disconnect
+// rewrites the client record with the lease fixed at disconnect time, while a
+// taken-over session leaves the (online) record untouched.
+func TestOnDisconnectPersistsSessionLease(t *testing.T) {
+	m := miniredis.RunT(t)
+	defer m.Close()
+	s := newHook(t, m.Addr())
+	defer teardown(t, s)
+
+	cl := &mqtt.Client{ID: "lease", Net: mqtt.ClientConnection{Remote: "r", Listener: "l"}}
+	s.OnSessionEstablished(cl, packets.Packet{})
+	cl.Stop(nil)
+	s.OnDisconnect(cl, nil, false)
+
+	row, err := s.db.HGet(s.ctx, s.hKey(storage.ClientKey), "lease").Result()
+	require.NoError(t, err)
+	r := new(storage.Client)
+	require.NoError(t, r.UnmarshalBinary([]byte(row)))
+	require.Equal(t, cl.DisconnectedAt(), r.DisconnectedAt)
+	require.Greater(t, r.DisconnectedAt, int64(0))
+
+	// taken-over connection: record must not be overwritten with a stale lease
+	taken := &mqtt.Client{ID: "take", Net: mqtt.ClientConnection{Remote: "r", Listener: "l"}}
+	s.OnSessionEstablished(taken, packets.Packet{})
+	taken.Stop(packets.ErrSessionTakenOver)
+	s.OnDisconnect(taken, nil, false)
+	row, err = s.db.HGet(s.ctx, s.hKey(storage.ClientKey), "take").Result()
+	require.NoError(t, err)
+	r2 := new(storage.Client)
+	require.NoError(t, r2.UnmarshalBinary([]byte(row)))
+	require.Equal(t, int64(0), r2.DisconnectedAt, "taken-over session keeps its online record")
 }
 
 func TestOnClientExpiredClosedDB(t *testing.T) {

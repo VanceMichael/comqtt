@@ -157,6 +157,7 @@ type ClientState struct {
 	Inflight        *Inflight            // a map of in-flight qos messages
 	Subscriptions   *Subscriptions       // a map of the subscription filters a client maintains
 	disconnected    int64                // the time the client disconnected in unix time, for calculating expiry
+	expiresAt       int64                // the absolute unix deadline of the session lease, computed at disconnect time
 	outbound        chan *packets.Packet // queue for pending outbound packets
 	endOnce         sync.Once            // only end once
 	isTakenOver     uint32               // used to identify orphaned clients
@@ -400,8 +401,49 @@ func (cl *Client) Stop(err error) {
 			cl.State.cancelOpen()
 		}
 
-		atomic.StoreInt64(&cl.State.disconnected, time.Now().Unix())
+		// Record the session lease as of the disconnect moment so that expiry keeps
+		// counting from this exact time, even if the broker is restarted before the
+		// lease elapses.
+		now := time.Now().Unix()
+		atomic.StoreInt64(&cl.State.disconnected, now)
+		atomic.StoreInt64(&cl.State.expiresAt, cl.sessionExpiresAt(now))
 	})
+}
+
+// DisconnectedAt returns the unix time the client connection went down, or zero
+// while the client is connected.
+func (cl *Client) DisconnectedAt() int64 {
+	return atomic.LoadInt64(&cl.State.disconnected)
+}
+
+// SessionExpiresAt returns the absolute unix deadline of the session lease that was
+// determined when the client disconnected. It is zero for connected clients and for
+// sessions without a persistent lease (clean sessions / mqtt v5 expiry interval 0).
+func (cl *Client) SessionExpiresAt() int64 {
+	return atomic.LoadInt64(&cl.State.expiresAt)
+}
+
+// sessionExpiresAt computes the absolute session lease deadline for a disconnection
+// happening at now. The lease uses the session expiry interval in effect at disconnect
+// time: the CONNECT value, possibly updated by a DISCONNECT packet for mqtt v5, or the
+// server maximum session expiry interval for mqtt v3 persistent sessions. A zero
+// interval means the session state must be discarded on disconnect, so no lease is
+// recorded.
+func (cl *Client) sessionExpiresAt(now int64) int64 {
+	if cl.ops == nil || cl.ops.options == nil || cl.ops.options.Capabilities == nil {
+		return 0
+	}
+
+	interval := int64(cl.ops.options.Capabilities.MaximumSessionExpiryInterval)
+	if cl.Properties.ProtocolVersion == 5 {
+		interval = int64(cl.Properties.Props.SessionExpiryInterval)
+	}
+
+	if interval <= 0 {
+		return 0
+	}
+
+	return now + interval
 }
 
 // StopCause returns the reason the client connection was stopped, if any.
