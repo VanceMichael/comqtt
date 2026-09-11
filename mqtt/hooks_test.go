@@ -402,6 +402,55 @@ func TestHooksOnAuthPacket(t *testing.T) {
 	require.Equal(t, uint16(10), pk.PacketID)
 }
 
+// authStateObserverHook records OnAuthStateChange events without participating
+// in the enhanced authentication exchange.
+type authStateObserverHook struct {
+	HookBase
+	events []authStateEvent
+}
+
+type authStateEvent struct {
+	state  AuthState
+	method string
+	reason packets.Code
+}
+
+func (h *authStateObserverHook) ID() string { return "auth-state-observer" }
+
+func (h *authStateObserverHook) Provides(b byte) bool {
+	return b == OnAuthStateChange
+}
+
+func (h *authStateObserverHook) OnAuthStateChange(cl *Client, state AuthState, method string, reason packets.Code) {
+	h.events = append(h.events, authStateEvent{state: state, method: method, reason: reason})
+}
+
+func TestHooksOnAuthStateChange(t *testing.T) {
+	h := new(Hooks)
+	h.Log = logger
+
+	observer := new(authStateObserverHook)
+	require.NoError(t, h.Add(observer, nil))
+
+	// a hook that does not provide OnAuthStateChange must not be invoked.
+	other := new(modifiedHookBase) // Provides() returns true, but keeps HookBase no-op
+	require.NoError(t, h.Add(other, nil))
+
+	cl := new(Client)
+	h.OnAuthStateChange(cl, AuthStatePending, "SCRAM-SHA-256", packets.CodeSuccess)
+	h.OnAuthStateChange(cl, AuthStateAuthenticated, "SCRAM-SHA-256", packets.CodeSuccess)
+	h.OnAuthStateChange(cl, AuthStateFailed, "SCRAM-SHA-256", packets.ErrNotAuthorized)
+
+	require.Len(t, observer.events, 3)
+	require.Equal(t, authStateEvent{AuthStatePending, "SCRAM-SHA-256", packets.CodeSuccess}, observer.events[0])
+	require.Equal(t, authStateEvent{AuthStateAuthenticated, "SCRAM-SHA-256", packets.CodeSuccess}, observer.events[1])
+	require.Equal(t, authStateEvent{AuthStateFailed, "SCRAM-SHA-256", packets.ErrNotAuthorized}, observer.events[2])
+
+	// HookBase default implementation is a no-op.
+	base := new(HookBase)
+	base.OnAuthStateChange(cl, AuthStatePending, "m", packets.CodeSuccess)
+}
+
 func TestHooksOnConnect(t *testing.T) {
 	h := new(Hooks)
 	h.Log = logger

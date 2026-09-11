@@ -35,6 +35,8 @@ type client struct {
 	BytesReceived   int64     `json:"bytes_received"`
 	BytesSent       int64     `json:"bytes_sent"`
 	Keepalive       uint16    `json:"keepalive"`
+	AuthState       string    `json:"auth_state"`  // MQTT v5 enhanced auth: none/pending/reauthenticating/authenticated/failed
+	AuthMethod      string    `json:"auth_method"` // Authentication Method declared in CONNECT
 }
 
 func genClient(cl *mqtt.Client) client {
@@ -58,6 +60,8 @@ func genClient(cl *mqtt.Client) client {
 		Keepalive:       cl.State.Keepalive,
 		BytesReceived:   cl.BytesRecv(),
 		BytesSent:       cl.BytesSent(),
+		AuthState:       cl.AuthState().String(),
+		AuthMethod:      cl.AuthenticationMethod(),
 	}
 	if cl.Properties.Will.Payload != nil {
 		nc.WillPayload = string(cl.Properties.Will.Payload)

@@ -57,6 +57,39 @@ func TestNewInflights(t *testing.T) {
 	require.NotNil(t, NewInflights().internal)
 }
 
+func TestClientEnhancedAuthState(t *testing.T) {
+	cl, _, _ := newTestClient()
+
+	// fresh clients start outside the enhanced authentication lifecycle.
+	require.Equal(t, AuthStateNone, cl.AuthState())
+	require.Equal(t, "", cl.AuthenticationMethod())
+	require.Equal(t, "none", AuthStateNone.String())
+	require.Equal(t, "pending", AuthStatePending.String())
+	require.Equal(t, "reauthenticating", AuthStateReAuthenticating.String())
+	require.Equal(t, "authenticated", AuthStateAuthenticated.String())
+	require.Equal(t, "failed", AuthStateFailed.String())
+
+	cl.setAuthMethod("SCRAM-SHA-256")
+	require.Equal(t, "SCRAM-SHA-256", cl.AuthenticationMethod())
+
+	// legal forward transition succeeds.
+	require.True(t, cl.casAuthState(AuthStateNone, AuthStatePending))
+	require.Equal(t, AuthStatePending, cl.AuthState())
+	require.True(t, cl.casAuthState(AuthStatePending, AuthStateAuthenticated))
+	require.Equal(t, AuthStateAuthenticated, cl.AuthState())
+
+	// a duplicate/concurrent transition from the same source state can only
+	// win once (after the first win the state is no longer Pending), and a
+	// transition from a non-current state fails, so the session is never
+	// advanced twice.
+	require.False(t, cl.casAuthState(AuthStatePending, AuthStateAuthenticated))
+	require.False(t, cl.casAuthState(AuthStateReAuthenticating, AuthStateAuthenticated))
+	require.False(t, cl.casAuthState(AuthStatePending, AuthStateFailed))
+
+	cl.storeAuthState(AuthStateFailed)
+	require.Equal(t, AuthStateFailed, cl.AuthState())
+}
+
 func TestNewClients(t *testing.T) {
 	cl := NewClients()
 	require.NotNil(t, cl.internal)

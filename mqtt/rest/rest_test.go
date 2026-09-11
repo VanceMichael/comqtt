@@ -90,6 +90,27 @@ func TestGetClientsWithSearch(t *testing.T) {
 	require.Equal(t, "alpha-device", resp.Items[0].ID)
 }
 
+func TestGetClientsExposeEnhancedAuthState(t *testing.T) {
+	_, server := newRestServer(t)
+
+	// a plain client (no Authentication Method) reports the none state
+	cl := server.NewClient(nil, "tcp", "client-plain", false)
+	cl.Net.Remote = "10.0.0.1:1234"
+	server.Clients.Add(cl)
+
+	r := &Rest{server: server}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/mqtt/clients", nil)
+	w := httptest.NewRecorder()
+	r.getClients(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp PagedResponse[client]
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Items, 1)
+	require.Equal(t, "none", resp.Items[0].AuthState, "plain connections report auth_state=none")
+	require.Equal(t, "", resp.Items[0].AuthMethod, "plain connections report no auth method")
+}
+
 func TestGetSubscriptions(t *testing.T) {
 	_, server := newRestServer(t)
 
